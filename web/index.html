@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="PencilPad">
+<meta name="application-name" content="PencilPad">
+<meta name="theme-color" content="#05060c">
+<meta name="format-detection" content="telephone=no">
+<title>PencilPad</title>
+<link rel="icon" href="icons/icon-192.png" type="image/png">
+<link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="stylesheet" href="app.css">
+<script type="importmap">
+{
+  "imports": {
+    "three": "./vendor/three.module.js",
+    "three/addons/": "./vendor/addons/"
+  }
+}
+</script>
+<script type="module" src="app.js"></script>
+</head>
+<body data-style="neon" data-conn="connecting">
+  <canvas id="fx" aria-hidden="true"></canvas>
+  <div id="surface" aria-label="Drawing surface"></div>
+
+  <div id="area" aria-hidden="true">
+    <i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
+    <span id="area-label"></span>
+    <div id="hint">
+      <strong>Draw with Apple Pencil</strong>
+      <span>Fingers only tap buttons</span>
+    </div>
+  </div>
+
+  <nav id="bar" aria-label="PencilPad controls">
+    <div class="status keep" title="Connection">
+      <span class="dot"></span><span id="status-text">Connecting</span>
+    </div>
+    <div id="targets" class="group" role="group" aria-label="Target screen"></div>
+    <span class="sep"></span>
+    <button type="button" class="tool" data-key="undo" title="Undo (Cmd Z)" aria-label="Undo">
+      <svg viewBox="0 0 24 24"><path d="M9 14 4 9l5-5"/><path d="M4 9h10.5a5.5 5.5 0 0 1 0 11H11"/></svg>
+    </button>
+    <button type="button" class="tool" data-key="redo" title="Redo (Cmd Shift Z)" aria-label="Redo">
+      <svg viewBox="0 0 24 24"><path d="m15 14 5-5-5-5"/><path d="M20 9H9.5a5.5 5.5 0 0 0 0 11H13"/></svg>
+    </button>
+    <button type="button" class="tool text" data-key="escape" title="Escape" aria-label="Escape">esc</button>
+    <button type="button" class="tool" id="rclick" title="Right-click the next Pencil tap" aria-label="Right-click next tap" aria-pressed="false">
+      <svg viewBox="0 0 24 24"><rect x="6" y="3" width="12" height="18" rx="6"/><path d="M12 3v7"/><path class="fill" d="M12 3.2a5.8 5.8 0 0 1 5.8 5.8v1H12z"/></svg>
+    </button>
+    <span class="sep"></span>
+    <button type="button" class="tool wide" id="style" title="Effects style" aria-label="Effects style">
+      <span class="swatch"></span><span id="style-name">Neon</span>
+    </button>
+    <button type="button" class="tool" id="clear" title="Clear trails" aria-label="Clear trails">
+      <svg viewBox="0 0 24 24"><path d="M20 20H9"/><path d="m4.6 15.4 9.9-9.9a2 2 0 0 1 2.8 0l2.2 2.2a2 2 0 0 1 0 2.8L11 19H8.2l-3.6-3.6"/><path d="m9.5 10.5 5 5"/></svg>
+    </button>
+    <button type="button" class="tool" id="fs" title="Full screen" aria-label="Full screen" hidden>
+      <svg class="on" viewBox="0 0 24 24"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></svg>
+      <svg class="off" viewBox="0 0 24 24"><path d="M9 4v5H4M15 4v5h5M9 20v-5H4M15 20v-5h5"/></svg>
+    </button>
+    <button type="button" class="tool keep" id="tuck" title="Hide toolbar" aria-label="Hide toolbar">
+      <svg viewBox="0 0 24 24"><path d="m6 15 6-6 6 6"/></svg>
+    </button>
+  </nav>
+
+  <div id="denied" hidden>
+    <div class="card">
+      <div class="dot"></div>
+      <h1>This link is out of date</h1>
+      <p>Open the current PencilPad link from the menu bar on your Mac.</p>
+      <button type="button" id="retry">Try again</button>
+    </div>
+  </div>
+
+  <div id="insets" aria-hidden="true"></div>
+</body>
+</html>
