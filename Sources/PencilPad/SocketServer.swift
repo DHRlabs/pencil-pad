@@ -31,7 +31,21 @@ final class SocketServer {
     private var watchdog: DispatchSourceTimer?
     private var clients: [Int: Client] = [:]
     private var nextID = 1
-    private(set) var active: Client?
+    /// The one authenticated client. While there is one, App Nap is held off so input never lags.
+    private(set) var active: Client? {
+        didSet {
+            if active != nil, appNapHold == nil {
+                appNapHold = ProcessInfo.processInfo.beginActivity(
+                    options: [.userInitiated, .latencyCritical], reason: "PencilPad iPad connected")
+                log.notice("activity begun: App Nap held off while client \(self.active?.id ?? 0) is connected")
+            } else if active == nil, let hold = appNapHold {
+                ProcessInfo.processInfo.endActivity(hold)
+                appNapHold = nil
+                log.notice("activity ended: no client connected")
+            }
+        }
+    }
+    private var appNapHold: NSObjectProtocol?
 
     init(targets: Targets, pen: Pen) {
         self.targets = targets

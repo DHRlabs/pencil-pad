@@ -23,9 +23,11 @@ final class Pen {
         if held != nil { release(reason: "down arrived while button held") }
         let button: CGMouseButton = right ? .right : .left
         let now = ProcessInfo.processInfo.systemUptime
+        // Distance in Mac points so it is the same in every direction, whatever the target's aspect ratio.
+        let w = target.rect.width, h = target.rect.height
         if let prev = lastDown, prev.button == button, prev.target == target,
            now - prev.time <= NSEvent.doubleClickInterval,
-           hypot(page.x - prev.page.x, page.y - prev.page.y) <= 0.004 {
+           hypot((page.x - prev.page.x) * w, (page.y - prev.page.y) * h) <= 0.004 * max(w, h) {
             clickState += 1
         } else {
             clickState = 1

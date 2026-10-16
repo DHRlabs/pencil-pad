@@ -115,6 +115,7 @@ final class Targets {
         }
         let appName = front.localizedName ?? "App"
         let axApp = AXUIElementCreateApplication(front.processIdentifier)
+        AXUIElementSetMessagingTimeout(axApp, 0.5)  // a hung front app cannot freeze the main thread
         var windowRef: CFTypeRef?
         let err = AXUIElementCopyAttributeValue(axApp, kAXFocusedWindowAttribute as CFString, &windowRef)
         guard err == .success, let windowRef, CFGetTypeID(windowRef) == AXUIElementGetTypeID() else {
@@ -122,6 +123,7 @@ final class Targets {
             return nil
         }
         let window = windowRef as! AXUIElement
+        AXUIElementSetMessagingTimeout(window, 0.5)
         var origin = CGPoint.zero, size = CGSize.zero
         var posRef: CFTypeRef?, sizeRef: CFTypeRef?
         guard AXUIElementCopyAttributeValue(window, kAXPositionAttribute as CFString, &posRef) == .success,
