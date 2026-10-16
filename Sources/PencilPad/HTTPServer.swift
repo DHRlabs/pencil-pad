@@ -8,6 +8,8 @@ final class HTTPServer {
 
     private let root: URL?
     private var listener: NWListener?
+    /// Connections still waiting for their request head; only these are cut at the 10 s deadline.
+    private var awaitingHead: Set<ObjectIdentifier> = []
 
     /// The bundled page when running as PencilPad.app, else the PENCILPAD_WEB folder.
     static func webRoot() -> URL? {
@@ -44,12 +46,19 @@ final class HTTPServer {
                 }
             }
             listener.newConnectionHandler = { [weak self] conn in
+                let id = ObjectIdentifier(conn)
                 MainActor.assumeIsolated {
+                    self?.awaitingHead.insert(id)
                     conn.start(queue: .main)
                     self?.read(conn, Data())
                 }
-                // Idle deadline: every connection is gone 10 s after accept (a no-op if it already finished).
-                DispatchQueue.main.asyncAfter(deadline: .now() + 10) { conn.cancel() }
+                // Idle deadline: a connection that has not sent its request head 10 s after accept is cut.
+                // The closure keeps conn alive until then, so its identifier cannot be reused meanwhile.
+                DispatchQueue.main.asyncAfter(deadline: .now() + 10) { [weak self] in
+                    MainActor.assumeIsolated {
+                        if self?.awaitingHead.remove(id) != nil { conn.cancel() }
+                    }
+                }
             }
             listener.start(queue: .main)
             self.listener = listener
@@ -64,8 +73,13 @@ final class HTTPServer {
                 var buffer = buffer
                 if let data { buffer.append(data) }
                 if let end = buffer.range(of: Data("\r\n\r\n".utf8)) {
+                    self?.awaitingHead.remove(ObjectIdentifier(conn))  // head is in; the response send is not cut short
                     self?.respond(conn, head: buffer[..<end.lowerBound])
-                } else if error != nil || isComplete || buffer.count > 16 * 1024 {
+                } else if buffer.count > 16 * 1024 {
+                    self?.awaitingHead.remove(ObjectIdentifier(conn))
+                    self?.respond(conn, head: Data())  // oversized head: 404 like any other bad request
+                } else if error != nil || isComplete {
+                    self?.awaitingHead.remove(ObjectIdentifier(conn))
                     conn.cancel()
                 } else {
                     self?.read(conn, buffer)
@@ -77,25 +91,21 @@ final class HTTPServer {
     private func respond(_ conn: NWConnection, head: Data) {
         let requestLine = String(decoding: head, as: UTF8.self).components(separatedBy: "\r\n").first ?? ""
         let parts = requestLine.split(separator: " ")
-        let status: Int, type: String, body: Data
+        // Only a GET under the token is answered; any other method, path, or unparsable request is 404.
+        var (status, type, body) = (404, "text/plain; charset=utf-8", Data("Not found\n".utf8))
         var location: String?
         let bare = "/\(Settings.token)"
-        if parts.count < 2 {
-            (status, type, body) = (400, "text/plain; charset=utf-8", Data("Bad request\n".utf8))
-        } else if parts[0] != "GET" {
-            (status, type, body) = (405, "text/plain; charset=utf-8", Data("Method not allowed\n".utf8))
-        } else if parts[1] == bare || parts[1].hasPrefix(bare + "?") {
-            // The page's relative URLs only resolve under the slash, so send the browser there.
-            (status, type, body) = (301, "text/plain; charset=utf-8", Data("Moved\n".utf8))
-            location = bare + "/" + parts[1].dropFirst(bare.count)
-        } else if let file = lookup(String(parts[1])) {
-            (status, type, body) = (200, file.type, file.data)
-        } else {
-            (status, type, body) = (404, "text/plain; charset=utf-8", Data("Not found\n".utf8))
+        if parts.count >= 2, parts[0] == "GET" {
+            if parts[1] == bare || parts[1].hasPrefix(bare + "?") {
+                // The page's relative URLs only resolve under the slash, so send the browser there.
+                (status, body) = (301, Data("Moved\n".utf8))
+                location = bare + "/" + parts[1].dropFirst(bare.count)
+            } else if let file = lookup(String(parts[1])) {
+                (status, type, body) = (200, file.type, file.data)
+            }
         }
         log.debug("http \(status)")
-        let reason = [200: "OK", 301: "Moved Permanently", 400: "Bad Request", 404: "Not Found",
-                      405: "Method Not Allowed"][status] ?? ""
+        let reason = [200: "OK", 301: "Moved Permanently", 404: "Not Found"][status] ?? ""
         var head = ["HTTP/1.1 \(status) \(reason)", "Content-Type: \(type)", "Content-Length: \(body.count)",
                     "Cache-Control: no-cache", "Connection: close"]
         if let location { head.append("Location: \(location)") }

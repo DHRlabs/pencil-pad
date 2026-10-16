@@ -35,10 +35,14 @@ let delegate = AppDelegate()
 app.delegate = delegate
 app.setActivationPolicy(.accessory)
 
-// SIGTERM (pkill, logout) goes through normal termination so a held button is released.
-signal(SIGTERM, SIG_IGN)
-let sigterm = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
-sigterm.setEventHandler { MainActor.assumeIsolated { NSApp.terminate(nil) } }
-sigterm.resume()
+// SIGTERM (pkill, logout), SIGINT (Ctrl-C) and SIGHUP (closed terminal) go through normal termination
+// so a held button is released.
+let quitSignals = [SIGTERM, SIGINT, SIGHUP].map { sig in
+    signal(sig, SIG_IGN)
+    let source = DispatchSource.makeSignalSource(signal: sig, queue: .main)
+    source.setEventHandler { MainActor.assumeIsolated { NSApp.terminate(nil) } }
+    source.resume()
+    return source
+}
 
 app.run()

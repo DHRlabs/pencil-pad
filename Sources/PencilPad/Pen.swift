@@ -10,7 +10,8 @@ final class Pen {
     private var loggedFirstPost = false
     /// Click count for the current press (2 = double, 3 = triple); its drags and up carry the same value.
     private var clickState: Int64 = 1
-    private var lastDown: (time: TimeInterval, at: CGPoint, button: CGMouseButton)?
+    /// Previous press, in the page's 0...1 coordinates on its target, for double-click detection.
+    private var lastDown: (time: TimeInterval, page: CGPoint, target: Target, button: CGMouseButton)?
 
     func hover(_ at: CGPoint) {
         // A move with no button down stays a plain move; a hover while held means the lift was lost.
@@ -18,17 +19,18 @@ final class Pen {
         post(.mouseMoved, at: at, button: .left, pressure: 0, tilt: (0, 0))
     }
 
-    func down(_ at: CGPoint, pressure: Double, tilt: (Double, Double), right: Bool) {
+    func down(_ at: CGPoint, page: CGPoint, target: Target, pressure: Double, tilt: (Double, Double), right: Bool) {
         if held != nil { release(reason: "down arrived while button held") }
         let button: CGMouseButton = right ? .right : .left
         let now = ProcessInfo.processInfo.systemUptime
-        if let prev = lastDown, prev.button == button, now - prev.time <= NSEvent.doubleClickInterval,
-           hypot(at.x - prev.at.x, at.y - prev.at.y) <= 5 {
+        if let prev = lastDown, prev.button == button, prev.target == target,
+           now - prev.time <= NSEvent.doubleClickInterval,
+           hypot(page.x - prev.page.x, page.y - prev.page.y) <= 0.004 {
             clickState += 1
         } else {
             clickState = 1
         }
-        lastDown = (now, at, button)
+        lastDown = (now, page, target, button)
         held = button
         post(right ? .rightMouseDown : .leftMouseDown, at: at, button: button, pressure: pressure, tilt: tilt)
     }
@@ -88,6 +90,7 @@ final class Pen {
         if type != .mouseMoved {
             event.setIntegerValueField(.mouseEventClickState, value: clickState)
         }
+        let pressure = pressure.isFinite ? min(max(pressure, 0), 1) : 0
         event.setIntegerValueField(.mouseEventSubtype, value: Int64(CGEventMouseSubtype.tabletPoint.rawValue))
         event.setDoubleValueField(.mouseEventPressure, value: pressure)
         event.setDoubleValueField(.tabletEventPointPressure, value: pressure)

@@ -4,8 +4,8 @@ import SystemConfiguration
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
-    private let targets = Targets()
     private let pen = Pen()
+    private lazy var targets = Targets(pen: pen)
     private lazy var socket = SocketServer(targets: targets, pen: pen)
     private lazy var http = HTTPServer(root: HTTPServer.webRoot())
     private var statusItem: NSStatusItem?

@@ -6,7 +6,6 @@ final class Client {
     let id: Int
     let conn: NWConnection
     var authed = false
-    var denied = false
     var ended = false
     let opened = ProcessInfo.processInfo.systemUptime
     var lastFrame = ProcessInfo.processInfo.systemUptime
@@ -21,8 +20,10 @@ final class Client {
 @MainActor
 final class SocketServer {
     nonisolated static let port: NWEndpoint.Port = 8711
+    /// Silence that releases a held button.
     static let silenceLimit: TimeInterval = 2
-    static let helloLimit: TimeInterval = 10
+    /// Time allowed to send a valid hello, and silence that closes a logged-in client.
+    static let idleLimit: TimeInterval = 10
 
     private let targets: Targets
     private let pen: Pen
@@ -124,13 +125,14 @@ final class SocketServer {
                 default:
                     break
                 }
-                if !c.ended && !c.denied { self.receive(c) }
+                if !c.ended { self.receive(c) }
             }
         }
     }
 
     /// The only way a client ends. If it is the active client, its held button is released first.
-    private func end(_ c: Client, reason: String, closeFrame: Bool) {
+    /// `farewell` ("denied", "replaced") is sent as {"t": farewell} just before the close frame.
+    private func end(_ c: Client, reason: String, farewell: String? = nil, closeFrame: Bool) {
         guard !c.ended else { return }
         c.ended = true
         clients[c.id] = nil
@@ -141,11 +143,12 @@ final class SocketServer {
         log.notice("client \(c.id) closed: \(reason, privacy: .public)")
         let conn = c.conn
         conn.stateUpdateHandler = nil  // breaks the Client <-> handler cycle; the clients dictionary was the owner
-        // A close frame only goes out on a finished WebSocket handshake; otherwise it would queue forever.
+        // Frames only go out on a finished WebSocket handshake; otherwise they would queue forever.
         guard closeFrame, case .ready = conn.state else {
             conn.cancel()
             return
         }
+        if let farewell { write(conn, ["t": farewell]) }
         let meta = NWProtocolWebSocket.Metadata(opcode: .close)
         meta.closeCode = .protocolCode(.normalClosure)
         let context = NWConnection.ContentContext(identifier: "close", metadata: [meta])
@@ -157,12 +160,17 @@ final class SocketServer {
     private func tick() {
         let now = ProcessInfo.processInfo.systemUptime
         // A connection that has not proven the token within 10 s is closed.
-        for c in Array(clients.values) where !c.authed && now - c.opened >= Self.helloLimit {
-            end(c, reason: "no valid hello within \(Int(Self.helloLimit)) s", closeFrame: true)
+        for c in Array(clients.values) where !c.authed && now - c.opened >= Self.idleLimit {
+            end(c, reason: "no valid hello within \(Int(Self.idleLimit)) s", closeFrame: true)
         }
-        // Stuck-button watchdog: an active client silent for 2 s loses its held button.
-        if let c = active, pen.held != nil, now - c.lastFrame >= Self.silenceLimit {
-            pen.release(reason: "client \(c.id) silent for \(String(format: "%.2f", now - c.lastFrame)) s")
+        guard let c = active else { return }
+        let silent = now - c.lastFrame
+        if silent >= Self.idleLimit {
+            // A logged-in client silent for 10 s is gone; end() releases any held button first.
+            end(c, reason: "silent for \(String(format: "%.2f", silent)) s", closeFrame: true)
+        } else if pen.held != nil, silent >= Self.silenceLimit {
+            // Stuck-button watchdog: silent for 2 s mid-stroke loses the held button.
+            pen.release(reason: "client \(c.id) silent for \(String(format: "%.2f", silent)) s")
         }
     }
 
@@ -173,7 +181,7 @@ final class SocketServer {
               let t = msg["t"] as? String
         else {
             log.error("client \(c.id): frame is not a protocol message")
-            if !c.authed { deny(c, why: "first frame is not JSON") }
+            if !c.authed { deny(c, why: "first frame is not a protocol message") }
             return
         }
 
@@ -181,35 +189,42 @@ final class SocketServer {
             if t == "hello", let token = msg["token"] as? String, token == Settings.token {
                 authenticate(c)
             } else {
-                deny(c, why: t == "hello" ? "wrong token" : "first frame was \(t), not hello")
+                deny(c, why: t == "hello" ? "wrong token" : "first frame was not hello")
             }
             return
         }
         guard c === active else { return }
 
-        func num(_ key: String) -> Double? { (msg[key] as? NSNumber)?.doubleValue }
-        func point() -> CGPoint? {
-            guard let x = num("x"), let y = num("y") else { return nil }
-            return targets.current.point(x: x, y: y)
+        /// Wire numbers; anything missing or non-finite counts as absent.
+        func num(_ key: String) -> Double? {
+            guard let value = (msg[key] as? NSNumber)?.doubleValue, value.isFinite else { return nil }
+            return value
         }
+        let x = num("x"), y = num("y")
+        let at = x.flatMap { x in y.map { y in targets.current.point(x: x, y: y) } }
         let pressure = num("p") ?? 0
         let tilt = (num("tx") ?? 0, num("ty") ?? 0)
 
         switch t {
         case "hover":
-            if let at = point() { pen.hover(at) }
+            if let at { pen.hover(at) }
         case "down":
-            if let at = point() { pen.down(at, pressure: pressure, tilt: tilt, right: msg["b"] as? String == "right") }
+            if let at, let x, let y {
+                pen.down(at, page: CGPoint(x: x, y: y), target: targets.current,
+                         pressure: pressure, tilt: tilt, right: msg["b"] as? String == "right")
+            }
         case "move":
-            if let at = point() { pen.move(at, pressure: pressure, tilt: tilt) }
+            if let at { pen.move(at, pressure: pressure, tilt: tilt) }
         case "up":
-            if let at = point() { pen.up(at) } else { pen.release(reason: "up without coordinates") }
+            if let at { pen.up(at) } else { pen.release(reason: "up without coordinates") }
         case "target":
             if let id = msg["id"] as? String { targets.select(id) }
             send(c, ["t": "target", "target": targets.current.json])  // reply even when unchanged, so the page stays in sync
         case "key":
             if let name = msg["name"] as? String { pen.key(name) }
-        case "ping", "hello":
+        case "ping":
+            send(c, ["t": "pong"])
+        case "hello":
             break
         default:
             log.debug("client \(c.id): unknown message \(t, privacy: .public)")
@@ -218,7 +233,7 @@ final class SocketServer {
 
     private func authenticate(_ c: Client) {
         if let old = active, old !== c {
-            end(old, reason: "replaced by newer client \(c.id)", closeFrame: true)
+            end(old, reason: "replaced by newer client \(c.id)", farewell: "replaced", closeFrame: true)
         }
         c.authed = true
         c.lastFrame = ProcessInfo.processInfo.systemUptime
@@ -228,23 +243,21 @@ final class SocketServer {
     }
 
     private func deny(_ c: Client, why: String) {
-        guard !c.denied else { return }
-        c.denied = true
         log.notice("hello denied: client \(c.id) (\(why, privacy: .public))")
-        send(c, ["t": "denied"]) { [weak self] in
-            self?.end(c, reason: "denied", closeFrame: true)
-        }
+        end(c, reason: "denied", farewell: "denied", closeFrame: true)
     }
 
-    private func send(_ c: Client, _ msg: [String: Any], then: (@MainActor @Sendable () -> Void)? = nil) {
-        guard !c.ended, let data = try? JSONSerialization.data(withJSONObject: msg) else { return }
+    private func send(_ c: Client, _ msg: [String: Any]) {
+        guard !c.ended else { return }
+        write(c.conn, msg)
+    }
+
+    private func write(_ conn: NWConnection, _ msg: [String: Any]) {
+        guard let data = try? JSONSerialization.data(withJSONObject: msg) else { return }
         let meta = NWProtocolWebSocket.Metadata(opcode: .text)
         let context = NWConnection.ContentContext(identifier: "text", metadata: [meta])
-        c.conn.send(content: data, contentContext: context, isComplete: true, completion: .contentProcessed { error in
-            MainActor.assumeIsolated {
-                if let error { log.error("client \(c.id): send failed: \(error, privacy: .public)") }
-                then?()
-            }
+        conn.send(content: data, contentContext: context, isComplete: true, completion: .contentProcessed { error in
+            if let error { log.error("send failed: \(error, privacy: .public)") }
         })
     }
 }

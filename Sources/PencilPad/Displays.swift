@@ -45,10 +45,18 @@ struct Target: Equatable {
 
 @MainActor
 final class Targets {
+    private let pen: Pen
     private(set) var screens: [Screen]
-    private(set) var current: Target
+    /// Every target change (page pick, menu pick, display fallback) lifts a held button first,
+    /// so a stroke never continues into a different rect.
+    private(set) var current: Target {
+        didSet {
+            if current != oldValue { pen.release(reason: "target changed to \(current.name)") }
+        }
+    }
 
-    init() {
+    init(pen: Pen) {
+        self.pen = pen
         let screens = Screen.all()
         self.screens = screens
         let saved = screens.first { $0.id == Settings.targetScreenID }
