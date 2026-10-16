@@ -59,10 +59,19 @@ final class Targets {
         self.pen = pen
         let screens = Screen.all()
         self.screens = screens
-        let saved = screens.first { $0.id == Settings.targetScreenID }
-        let pick = saved ?? screens.first { $0.main } ?? screens.first
-        current = pick.map { Target(id: $0.id, name: $0.name, rect: $0.bounds) }
+        current = Self.preferred(screens).map { Target(id: $0.id, name: $0.name, rect: $0.bounds) }
             ?? Target(id: "none", name: "No screen", rect: CGDisplayBounds(CGMainDisplayID()))
+    }
+
+    /// The saved screen when it is connected, else main for now. Never writes the saved choice:
+    /// only an explicit pick in select() does, so a screen that drops out is picked back up when it returns.
+    private static func preferred(_ screens: [Screen]) -> Screen? {
+        let savedID = Settings.targetScreenID
+        if let saved = screens.first(where: { $0.id == savedID }) { return saved }
+        if let savedID {
+            log.notice("target: saved screen \(savedID, privacy: .public) is not connected; using main for now, saved choice kept")
+        }
+        return screens.first { $0.main } ?? screens.first
     }
 
     /// Pick a screen by UUID (persisted) or "window" (read now, not persisted). Returns false if nothing changed.
@@ -88,15 +97,10 @@ final class Targets {
         let fresh = Screen.all()
         let screensChanged = fresh != screens
         screens = fresh
-        guard current.id != "window" else { return (screensChanged, false) }
+        // A window target stays put; a screen target follows the saved choice (back to it when it returns).
+        guard current.id != "window", let want = Self.preferred(fresh) else { return (screensChanged, false) }
         let old = current
-        if let same = fresh.first(where: { $0.id == current.id }) {
-            current = Target(id: same.id, name: same.name, rect: same.bounds)
-        } else if let main = fresh.first(where: { $0.main }) ?? fresh.first {
-            log.notice("target: screen \(old.id, privacy: .public) is gone; falling back to main \(main.name, privacy: .public)")
-            current = Target(id: main.id, name: main.name, rect: main.bounds)
-            Settings.targetScreenID = main.id
-        }
+        current = Target(id: want.id, name: want.name, rect: want.bounds)  // didSet releases a held button on change
         if current != old {
             log.notice("target: now \(self.current.name, privacy: .public) rect \(NSStringFromRect(self.current.rect), privacy: .public)")
         }
