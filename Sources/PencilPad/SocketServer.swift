@@ -8,8 +8,8 @@ final class Client {
     var authed = false
     var denied = false
     var ended = false
+    let opened = ProcessInfo.processInfo.systemUptime
     var lastFrame = ProcessInfo.processInfo.systemUptime
-    var silenceHandled = false
 
     init(id: Int, conn: NWConnection) {
         self.id = id
@@ -22,6 +22,7 @@ final class Client {
 final class SocketServer {
     nonisolated static let port: NWEndpoint.Port = 8711
     static let silenceLimit: TimeInterval = 2
+    static let helloLimit: TimeInterval = 10
 
     private let targets: Targets
     private let pen: Pen
@@ -61,11 +62,10 @@ final class SocketServer {
             log.error("socket listener could not start: \(error, privacy: .public)")
         }
 
-        // Stuck-button watchdog: an active client silent for 2 s loses its held button.
         let timer = DispatchSource.makeTimerSource(queue: .main)
         timer.schedule(deadline: .now() + 0.25, repeating: 0.25)
         timer.setEventHandler { [weak self] in
-            MainActor.assumeIsolated { self?.checkSilence() }
+            MainActor.assumeIsolated { self?.tick() }
         }
         timer.resume()
         watchdog = timer
@@ -115,7 +115,6 @@ final class SocketServer {
                     return
                 }
                 c.lastFrame = ProcessInfo.processInfo.systemUptime  // every frame counts, pings included
-                c.silenceHandled = false
                 switch meta.opcode {
                 case .close:
                     self.end(c, reason: "close frame from peer", closeFrame: false)
@@ -140,25 +139,31 @@ final class SocketServer {
             pen.release(reason: "client \(c.id) \(reason)")
         }
         log.notice("client \(c.id) closed: \(reason, privacy: .public)")
-        guard closeFrame else {
-            c.conn.cancel()
+        let conn = c.conn
+        conn.stateUpdateHandler = nil  // breaks the Client <-> handler cycle; the clients dictionary was the owner
+        // A close frame only goes out on a finished WebSocket handshake; otherwise it would queue forever.
+        guard closeFrame, case .ready = conn.state else {
+            conn.cancel()
             return
         }
         let meta = NWProtocolWebSocket.Metadata(opcode: .close)
         meta.closeCode = .protocolCode(.normalClosure)
         let context = NWConnection.ContentContext(identifier: "close", metadata: [meta])
-        let conn = c.conn
         conn.send(content: nil, contentContext: context, isComplete: true, completion: .contentProcessed { _ in
             conn.cancel()
         })
     }
 
-    private func checkSilence() {
-        guard let c = active, !c.silenceHandled else { return }
-        let silent = ProcessInfo.processInfo.systemUptime - c.lastFrame
-        guard silent >= Self.silenceLimit else { return }
-        c.silenceHandled = true
-        pen.release(reason: "client \(c.id) silent for \(String(format: "%.2f", silent)) s")
+    private func tick() {
+        let now = ProcessInfo.processInfo.systemUptime
+        // A connection that has not proven the token within 10 s is closed.
+        for c in Array(clients.values) where !c.authed && now - c.opened >= Self.helloLimit {
+            end(c, reason: "no valid hello within \(Int(Self.helloLimit)) s", closeFrame: true)
+        }
+        // Stuck-button watchdog: an active client silent for 2 s loses its held button.
+        if let c = active, pen.held != nil, now - c.lastFrame >= Self.silenceLimit {
+            pen.release(reason: "client \(c.id) silent for \(String(format: "%.2f", now - c.lastFrame)) s")
+        }
     }
 
     // MARK: Protocol

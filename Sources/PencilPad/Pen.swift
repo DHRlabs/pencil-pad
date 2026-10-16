@@ -1,5 +1,5 @@
+import AppKit
 import CoreGraphics
-import Foundation
 
 /// Turns Pencil messages into HID-level mouse/tablet events. Owns the one held button.
 @MainActor
@@ -8,6 +8,9 @@ final class Pen {
     private(set) var held: CGMouseButton?
     private var last = CGPoint.zero
     private var loggedFirstPost = false
+    /// Click count for the current press (2 = double, 3 = triple); its drags and up carry the same value.
+    private var clickState: Int64 = 1
+    private var lastDown: (time: TimeInterval, at: CGPoint, button: CGMouseButton)?
 
     func hover(_ at: CGPoint) {
         // A move with no button down stays a plain move; a hover while held means the lift was lost.
@@ -18,6 +21,14 @@ final class Pen {
     func down(_ at: CGPoint, pressure: Double, tilt: (Double, Double), right: Bool) {
         if held != nil { release(reason: "down arrived while button held") }
         let button: CGMouseButton = right ? .right : .left
+        let now = ProcessInfo.processInfo.systemUptime
+        if let prev = lastDown, prev.button == button, now - prev.time <= NSEvent.doubleClickInterval,
+           hypot(at.x - prev.at.x, at.y - prev.at.y) <= 5 {
+            clickState += 1
+        } else {
+            clickState = 1
+        }
+        lastDown = (now, at, button)
         held = button
         post(right ? .rightMouseDown : .leftMouseDown, at: at, button: button, pressure: pressure, tilt: tilt)
     }
@@ -75,7 +86,7 @@ final class Pen {
             return
         }
         if type != .mouseMoved {
-            event.setIntegerValueField(.mouseEventClickState, value: 1)
+            event.setIntegerValueField(.mouseEventClickState, value: clickState)
         }
         event.setIntegerValueField(.mouseEventSubtype, value: Int64(CGEventMouseSubtype.tabletPoint.rawValue))
         event.setDoubleValueField(.mouseEventPressure, value: pressure)
@@ -85,7 +96,7 @@ final class Pen {
         event.post(tap: .cghidEventTap)
         last = at
         noteFirstPost("mouse type \(type.rawValue)")
-        log.debug("posted \(type.rawValue) at \(NSStringFromPoint(at), privacy: .public) p \(pressure)")
+        log.debug("posted \(type.rawValue) at \(NSStringFromPoint(at), privacy: .public) p \(pressure) clicks \(type == .mouseMoved ? 0 : self.clickState)")
     }
 
     private func noteFirstPost(_ what: String) {
