@@ -4,10 +4,8 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
 <meta name="apple-mobile-web-app-capable" content="yes">
-<meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="apple-mobile-web-app-title" content="PencilPad">
-<meta name="application-name" content="PencilPad">
 <meta name="theme-color" content="#05060c">
 <meta name="format-detection" content="telephone=no">
 <title>PencilPad</title>
@@ -70,12 +68,21 @@
     </button>
   </nav>
 
-  <div id="denied" hidden>
+  <div id="denied" class="overlay" hidden>
     <div class="card">
       <div class="dot"></div>
       <h1>This link is out of date</h1>
       <p>Open the current PencilPad link from the menu bar on your Mac.</p>
       <button type="button" id="retry">Try again</button>
+    </div>
+  </div>
+
+  <div id="replaced" class="overlay" hidden>
+    <div class="card">
+      <div class="dot"></div>
+      <h1>PencilPad is open somewhere else</h1>
+      <p>Another page took over the Mac. Tap below to use this one instead.</p>
+      <button type="button" id="takeover" class="big">Use here</button>
     </div>
   </div>
 

@@ -227,7 +227,9 @@ void main() {
 }`;
 
 export function start({ canvas, queue, ui }) {
-  const dpr = Math.min(devicePixelRatio || 1, 2);
+  // Effects render at CSS pixels (ratio 1) even on Retina: the look is soft glow, so it holds up,
+  // and it is a quarter of the pixels of 2x. The toolbar and frame stay sharp; they are DOM.
+  const dpr = 1;
   const renderer = new WebGLRenderer({
     canvas, antialias: false, alpha: false, depth: false, stencil: false, powerPreference: 'high-performance',
   });
@@ -498,7 +500,7 @@ export function start({ canvas, queue, ui }) {
     bgU.uArea.value.set(a.x, a.y, a.w, a.h);
     uTime.value = t;
 
-    // Idle: nothing alive and no pen, so the slow background only needs ~40 fps.
+    // Idle (nothing alive, no pen): draw every third frame, so 20 fps on a 60 Hz display, 40 fps on 120 Hz.
     if (!drawing && retA < 0.01 && t - lastActive > look.life + 1.5 && t - uClearAt.value > 0.5) {
       if (++skip % 3) return;
     }

@@ -4,6 +4,7 @@
 
 const WS_PORT = 8711;
 const PING_MS = 500;
+const DEAD_MS = 3000;     // no frame from the Mac for this long while connected: reconnect
 const PAD = 14;          // gap between the active area and the screen edges
 const GAP = 12;          // gap between the toolbar and the active area
 const STYLES = ['neon', 'aurora', 'ember', 'off'];
@@ -27,8 +28,8 @@ const wsURL = `ws://${location.hostname}:${WS_PORT}/`;
 const area = { x: 0, y: 0, w: 1, h: 1 };
 const ui = { area, rightArmed: false };
 
-let ws = null, ready = false, denied = false;
-let backoff = 500, retryTimer = 0, pingTimer = 0;
+let ws = null, ready = false, halted = '';   // halted: '' | 'denied' | 'replaced'
+let backoff = 500, retryTimer = 0, pingTimer = 0, lastRx = 0;
 let screens = [], target = null;
 let penId = -1, stroke = false, lastX = 0, lastY = 0, lastSX = 0, lastSY = 0;
 let tx = 0, ty = 0;
@@ -180,11 +181,11 @@ document.addEventListener('selectstart', (e) => e.preventDefault());
 // Stuck-button safety.
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'hidden') releaseStroke();
-  else if (!denied && (!ws || ws.readyState > 1)) { backoff = 500; connect(); }
+  else if (!halted && (!ws || ws.readyState > 1)) { backoff = 500; connect(); }
 });
 addEventListener('pagehide', releaseStroke);
 addEventListener('blur', releaseStroke);
-addEventListener('pageshow', (e) => { if (e.persisted && !denied) { backoff = 500; connect(); } });
+addEventListener('pageshow', (e) => { if (e.persisted && !halted) { backoff = 500; connect(); } });
 
 // ---------- Socket ----------
 
@@ -206,22 +207,40 @@ function connect() {
   const s = new WebSocket(wsURL);
   ws = s;
   s.onopen = () => {
+    lastRx = performance.now();
     s.send(JSON.stringify({ t: 'hello', token }));
-    pingTimer = setInterval(() => { if (s.readyState === 1) s.send('{"t":"ping"}'); }, PING_MS);
+    pingTimer = setInterval(() => {
+      if (s.readyState !== 1) return;
+      if (performance.now() - lastRx > DEAD_MS) { retry(s); return; }   // the Mac went silent: the socket is dead
+      s.send('{"t":"ping"}');
+    }, PING_MS);
   };
-  s.onmessage = (e) => onMessage(e.data);
+  s.onmessage = (e) => { lastRx = performance.now(); onMessage(e.data); };
   s.onerror = () => {};
-  s.onclose = () => {
-    if (ws !== s) return;
-    clearInterval(pingTimer);
-    ready = false;
-    releaseStroke();   // the socket is gone, so this only ends the stroke locally and in the effects
-    ws = null;
-    if (denied) return;
-    setConn('retry', 'Reconnecting');
-    retryTimer = setTimeout(connect, backoff);
-    backoff = Math.min(5000, Math.round(backoff * 1.7));
-  };
+  s.onclose = () => { if (ws === s) retry(s); };
+}
+
+// Drop this socket and try again with backoff, unless the Mac told us to stop.
+function retry(s) {
+  releaseStroke();   // sends up while a silent socket can still carry it; a closed one only ends the stroke locally
+  s.onopen = s.onmessage = s.onclose = s.onerror = null;
+  try { s.close(); } catch (_) {}
+  clearInterval(pingTimer);
+  ready = false; ws = null;
+  if (halted) return;
+  setConn('retry', 'Reconnecting');
+  retryTimer = setTimeout(connect, backoff);
+  backoff = Math.min(5000, Math.round(backoff * 1.7));
+}
+
+// Denied (wrong link) and replaced (another page took over) both stop retrying.
+function halt(kind, text) {
+  halted = kind; ready = false;
+  stroke = false; releaseStroke();   // the Mac already let go; end the stroke on this side only
+  clearTimeout(retryTimer); clearInterval(pingTimer);
+  setConn(kind, text);
+  $(kind).hidden = false;
+  try { ws && ws.close(); } catch (_) {}
 }
 
 function onMessage(data) {
@@ -244,11 +263,10 @@ function onMessage(data) {
       setTarget(m.target);
       break;
     case 'denied':
-      denied = true; ready = false;
-      clearTimeout(retryTimer); clearInterval(pingTimer);
-      setConn('denied', 'Wrong link');
-      $('denied').hidden = false;
-      try { ws && ws.close(); } catch (_) {}
+      halt('denied', 'Wrong link');
+      break;
+    case 'replaced':
+      halt('replaced', 'Open elsewhere');
       break;
   }
 }
@@ -308,6 +326,13 @@ targetsEl.addEventListener('click', (e) => {
 
 // ---------- Buttons ----------
 
+// A toolbar press that starts while the Pencil is down is a palm or a slip: swallow it before any button sees it.
+let pressDuringStroke = false;
+bar.addEventListener('pointerdown', () => { pressDuringStroke = penId !== -1; }, true);
+bar.addEventListener('click', (e) => {
+  if (penId !== -1 || pressDuringStroke) { e.stopPropagation(); e.preventDefault(); }
+}, true);
+
 for (const b of bar.querySelectorAll('[data-key]')) {
   b.addEventListener('click', () => { if (ready) send(`{"t":"key","name":"${b.dataset.key}"}`); });
 }
@@ -359,6 +384,11 @@ $('tuck').addEventListener('click', () => {
 if (store.get('tucked')) bar.classList.add('tucked');
 
 $('retry').addEventListener('click', () => location.reload());
+$('takeover').addEventListener('click', () => {
+  $('replaced').hidden = true;
+  halted = ''; backoff = 500;
+  connect();   // the newest page wins, so this takes the Mac back
+});
 
 addEventListener('resize', fit);
 addEventListener('orientationchange', () => requestAnimationFrame(fit));
