@@ -36,7 +36,7 @@ final class SocketServer {
         didSet {
             if active != nil, appNapHold == nil {
                 appNapHold = ProcessInfo.processInfo.beginActivity(
-                    options: [.userInitiated, .latencyCritical], reason: "PencilPad iPad connected")
+                    options: [.userInitiatedAllowingIdleSystemSleep, .latencyCritical], reason: "PencilPad iPad connected")
                 log.notice("activity begun: App Nap held off while client \(self.active?.id ?? 0) is connected")
             } else if active == nil, let hold = appNapHold {
                 ProcessInfo.processInfo.endActivity(hold)
