@@ -167,6 +167,22 @@ body.rarmed .corner { border-color: #ffb547; filter: drop-shadow(0 0 7px #ffb547
   background: conic-gradient(from 200deg, rgb(var(--accent)), rgb(var(--accent2)), rgb(var(--accent)));
   box-shadow: 0 0 12px rgb(var(--accent) / .7);
 }
+#bar #aim { position: relative; }
+#aim .core { fill: currentColor; stroke: none; opacity: .45; }
+#aim[data-mode="soft"] .core { opacity: .75; }
+#aim[data-mode="firm"] .core { opacity: 1; }
+#aim[data-mode="off"] { color: var(--muted); }
+#bar #aim:not([data-mode="off"]) { color: rgb(var(--accent)); }
+.hoverdot {
+  display: none; position: absolute; top: 7px; right: 6px;
+  width: 6px; height: 6px; border-radius: 50%;
+  background: #3ef08f; box-shadow: 0 0 6px #3ef08f;
+}
+#aim.hover .hoverdot { display: block; }
+/* No pen pressure seen yet: Aim is waiting (every touch clicks), so the chip shows the mode dimmed. */
+#bar #aim.nopressure { color: var(--muted); opacity: .6; }
+#aim.nopressure .core { fill: none; stroke: currentColor; stroke-width: 1.4; opacity: 1; }
+
 body[data-style="off"] .swatch { background: none; box-shadow: inset 0 0 0 1.5px var(--muted); }
 
 #fs .off, body.fs #fs .on { display: none; }
@@ -178,9 +194,12 @@ body.fs #fs .off { display: block; }
 #bar.tucked .status #status-text { display: none; }
 
 @media (max-width: 900px) {
-  #status-text, #style-name { display: none; }
-  #bar .chip { max-width: 120px; }
-  #bar button { padding: 0 8px; }
+  /* Narrow (portrait) toolbar: labels go, buttons keep their 44 px touch size, spacing tightens. */
+  #status-text, #style-name, #aim-name { display: none; }
+  #bar .chip { max-width: 104px; }
+  #bar button, #bar .wide { padding: 0 6px; }
+  .status { padding: 0 6px; }
+  .sep { margin: 0 2px; }
 }
 
 /* Wrong link or taken over elsewhere: the socket stops retrying until the person acts. */

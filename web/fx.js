@@ -11,7 +11,7 @@ import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
 import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
 import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
 import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
-import { HOVER, DOWN, MOVE, UP, LEAVE } from './app.js';
+import { HOVER, DOWN, MOVE, UP, LEAVE, AIM } from './app.js';
 
 const SEG_CAP = 6144;     // ribbon segments kept in the ring (4 vertices each)
 const SPARK_CAP = 2400;   // spark particles in the ring
@@ -205,14 +205,14 @@ varying vec2 vUv;
 void main() { vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }`;
 
 const RET_FS = /* glsl */`
-uniform float uTime, uA, uDown, uP, uArmed;
+uniform float uTime, uA, uDown, uP, uArmed, uAim, uAiming;
 uniform vec3 uC1, uC2, uArm;
 varying vec2 vUv;
 void main() {
   vec2 c = (vUv - 0.5) * 2.0;
   float r = length(c);
   float ang = atan(c.y, c.x);
-  float R = mix(0.42, 0.17, uDown);
+  float R = mix(mix(0.42, 0.33, uAiming), 0.17, uDown);
   float ring = exp(-pow((r - R) / 0.016, 2.0));
   float halo = exp(-pow((r - R) / 0.13, 2.0)) * 0.14;
   float rot = uTime * mix(0.7, 2.6, uArmed);
@@ -222,7 +222,15 @@ void main() {
   float arcT = fract((ang + 1.5708) / 6.28318 + 1.0);
   float arc = uDown * step(arcT, uP) * exp(-pow((r - R - 0.11) / 0.018, 2.0));
   vec3 base = mix(uC1, uArm, uArmed);
-  vec3 col = base * (ring * dash * 1.15 + halo + tick * 0.7 + arc * 1.5) + uC2 * tip * 1.1;
+  // Aiming (touching below the click threshold): the hollow ring fills clockwise from the top as
+  // pressure rises toward the threshold, and the core charges up; crossing it hands over to the pressed look.
+  float hollow = 1.0 - 0.75 * uAiming;   // while aiming the ring is a faint outline the fill sweeps over
+  float aimArc = uAiming * step(arcT, uAim) * exp(-pow((r - R) / 0.045, 2.0));
+  float aimHead = uAiming * exp(-pow((arcT - uAim) / 0.02, 2.0)) * exp(-pow((r - R) / 0.06, 2.0));
+  float aimCore = uAiming * uAim * uAim * (1.0 - smoothstep(0.0, R * 0.7, r));
+  float aimEdge = uAiming * smoothstep(0.85, 1.0, uAim) * exp(-pow((r - R - 0.06) / 0.025, 2.0));
+  vec3 col = base * ((ring * dash * 1.15 + halo + tick * 0.7) * hollow + arc * 1.5 + aimArc * 2.2 + aimEdge * 0.8)
+           + uC2 * (tip * 1.1 + aimCore * 0.25 + aimHead * 1.2);
   gl_FragColor = vec4(col * uA, 1.0);
 }`;
 
@@ -316,7 +324,7 @@ export function start({ canvas, queue, ui }) {
 
   // Reticle.
   const retU = {
-    uTime, uA: { value: 0 }, uDown: { value: 0 }, uP: { value: 0 }, uArmed: { value: 0 },
+    uTime, uA: { value: 0 }, uDown: { value: 0 }, uP: { value: 0 }, uArmed: { value: 0 }, uAim: { value: 0 }, uAiming: { value: 0 },
     uC1: { value: new Color() }, uC2: { value: new Color() }, uArm: { value: new Color(0xffa63d) },
   };
   const reticle = new Mesh(new PlaneGeometry(1, 1), new ShaderMaterial({ uniforms: retU, vertexShader: RET_VS, fragmentShader: RET_FS, ...additive }));
@@ -353,6 +361,7 @@ export function start({ canvas, queue, ui }) {
   let drawing = false, lx = 0, ly = 0, lb = 0, lp = 0, lw = 0, prevSeg = -1, pnx = 0, pny = 0, emitAcc = 0;
   let mx = 0, my = 0;                                       // smoothed ribbon point
   let retX = -9999, retY = -9999, retSeen = -99, retA = 0, retDown = 0, retP = 0;
+  let aimOn = false, aimFrac = 0;                           // touching below the click threshold
 
   const halfW = (p) => (0.9 + 6.6 * Math.pow(p, 0.8)) * look.width;
   const rand = (a, b) => a + Math.random() * (b - a);
@@ -441,8 +450,11 @@ export function start({ canvas, queue, ui }) {
       const t = (b[o + 7] - t0) / 1000;
       lastActive = t;
       if (type === HOVER) {
-        retX = rx; retY = ry; retSeen = t; retP = 0;
+        retX = rx; retY = ry; retSeen = t; retP = 0; aimOn = false;
+      } else if (type === AIM) {
+        retX = rx; retY = ry; retSeen = t; retP = p; aimOn = true; aimFrac = b[o + 6];
       } else if (type === DOWN) {
+        aimOn = false;
         drawing = true; lx = mx = sx; ly = my = sy; lb = t; lp = p; lw = halfW(p); prevSeg = -1; emitAcc = 0;
         burst(rx, ry, p, t, Math.round(look.spark.burst * (0.5 + p)));
         ripple(sx, sy, t, 1); lastRip = t;
@@ -452,9 +464,9 @@ export function start({ canvas, queue, ui }) {
         retX = rx; retY = ry; retSeen = t; retP = p;
       } else if (type === UP) {
         if (drawing) burst(lx, ly, 0.2, t, 6);
-        drawing = false; prevSeg = -1;
+        drawing = false; prevSeg = -1; aimOn = false;
       } else if (type === LEAVE) {
-        retSeen = -99;
+        retSeen = -99; aimOn = false;
       }
     }
     read = queue.head;
@@ -486,12 +498,14 @@ export function start({ canvas, queue, ui }) {
     if (pDirty1 >= 0) { flush(sparkAttrs, pDirty0, pDirty1, 1); pDirty0 = Infinity; pDirty1 = -1; }
 
     // Reticle follows hover and contact, fades shortly after the pen leaves.
-    const visible = drawing || t - retSeen < 0.18;
+    const visible = drawing || aimOn || t - retSeen < 0.18;
     retA += ((visible ? 1 : 0) - retA) * (1 - Math.exp(-dt * 14));
     retDown += ((drawing ? 1 : 0) - retDown) * (1 - Math.exp(-dt * 18));
     retU.uA.value = retA; retU.uDown.value = retDown;
     retU.uP.value += (retP - retU.uP.value) * (1 - Math.exp(-dt * 20));
     retU.uArmed.value += ((ui.rightArmed ? 1 : 0) - retU.uArmed.value) * (1 - Math.exp(-dt * 10));
+    retU.uAiming.value += ((aimOn ? 1 : 0) - retU.uAiming.value) * (1 - Math.exp(-dt * 16));
+    retU.uAim.value += ((aimOn ? aimFrac : 0) - retU.uAim.value) * (1 - Math.exp(-dt * 24));
     reticle.visible = retA > 0.01;
     reticle.position.set(retX, retY, 0);
     uHover.value.set(retX, retY, retA * (0.6 + 0.4 * retDown));
@@ -501,7 +515,7 @@ export function start({ canvas, queue, ui }) {
     uTime.value = t;
 
     // Idle (nothing alive, no pen): draw every third frame, so 20 fps on a 60 Hz display, 40 fps on 120 Hz.
-    if (!drawing && retA < 0.01 && t - lastActive > look.life + 1.5 && t - uClearAt.value > 0.5) {
+    if (!drawing && !aimOn && retA < 0.01 && t - lastActive > look.life + 1.5 && t - uClearAt.value > 0.5) {
       if (++skip % 3) return;
     }
     composer.render(dt);

@@ -10,8 +10,17 @@ const GAP = 12;          // gap between the toolbar and the active area
 const STYLES = ['neon', 'aurora', 'ember', 'off'];
 const STYLE_NAMES = { neon: 'Neon', aurora: 'Aurora', ember: 'Ember', off: 'Off' };
 
+// Aim (Wacom tip threshold): a touch lighter than this moves the cursor without clicking.
+// Safari reports Pencil pressure as force / maximum force: a light glide sits around 0.03 to 0.12,
+// normal writing around 0.2 to 0.35. Soft sits at the top of the glide band, so any deliberate
+// stroke clicks; Firm sits inside the writing band, so resting the tip with some weight still aims.
+const AIM_AT = { off: 0, soft: 0.12, firm: 0.25 };
+const AIM_MODES = ['off', 'soft', 'firm'];
+const AIM_NAMES = { off: 'Off', soft: 'Soft', firm: 'Firm' };
+const HOVER_CONFIRM_MS = 100;   // hardware hover counts once 3+ pen hover moves span this long with no touch between
+
 // Visual event queue shared with fx.js: a ring of fixed-size records, no allocation per event.
-export const HOVER = 0, DOWN = 1, MOVE = 2, UP = 3, LEAVE = 4;
+export const HOVER = 0, DOWN = 1, MOVE = 2, UP = 3, LEAVE = 4, AIM = 5;
 const Q_CAP = 1024, Q_STRIDE = 8;
 const queue = { buf: new Float64Array(Q_CAP * Q_STRIDE), cap: Q_CAP, stride: Q_STRIDE, head: 0 };
 
@@ -20,6 +29,7 @@ const body = document.body;
 const surface = $('surface'), bar = $('bar'), frame = $('area'), areaLabel = $('area-label');
 const targetsEl = $('targets'), statusText = $('status-text'), rclickBtn = $('rclick');
 const styleBtn = $('style'), styleName = $('style-name'), fsBtn = $('fs'), insetsEl = $('insets');
+const aimBtn = $('aim'), aimName = $('aim-name');
 
 const token = location.pathname.split('/').filter(Boolean)[0] || '';
 const wsURL = `ws://${location.hostname}:${WS_PORT}/`;
@@ -32,6 +42,11 @@ let ws = null, ready = false, halted = '';   // halted: '' | 'denied' | 'replace
 let backoff = 500, retryTimer = 0, pingTimer = 0, lastRx = 0;
 let screens = [], target = null;
 let penId = -1, stroke = false, lastX = 0, lastY = 0, lastSX = 0, lastSY = 0;
+let aiming = false, aimX = 0, aimY = 0, aimP = 0, aimPending = false;   // Pencil touching below the aim threshold
+let hoverStart = 0, hoverCount = 0;
+// A Pencil without pressure hardware reports 0 forever and could never cross a threshold, so Aim
+// acts as Off until this device has shown a pen pressure above 0 (remembered like the hover dot).
+let pressureSeen = false;
 let tx = 0, ty = 0;
 let fx = null;
 
@@ -42,10 +57,11 @@ const store = {
 
 // ---------- Visual queue ----------
 
-function qv(type, sx, sy, p, rx, ry, tilt) {
+// aux: tilt magnitude for pen points, aim progress (pressure / threshold, 0 to 1) for AIM.
+function qv(type, sx, sy, p, rx, ry, aux) {
   const b = queue.buf, o = (queue.head % Q_CAP) * Q_STRIDE;
   b[o] = type; b[o + 1] = sx; b[o + 2] = sy; b[o + 3] = p;
-  b[o + 4] = rx; b[o + 5] = ry; b[o + 6] = tilt; b[o + 7] = performance.now();
+  b[o + 4] = rx; b[o + 5] = ry; b[o + 6] = aux; b[o + 7] = performance.now();
   queue.head++;
 }
 
@@ -94,28 +110,69 @@ const hasCoalesced = typeof PointerEvent !== 'undefined' && 'getCoalescedEvents'
 
 function send(s) { if (ws && ws.readyState === 1) ws.send(s); }
 
+function aimAt() { return pressureSeen ? AIM_AT[aimMode] : 0; }
+
+function notePressure(p) {
+  if (pressureSeen || !(p > 0)) return;
+  pressureSeen = true;
+  store.set('pressureSeen', '1');
+  applyAim();
+}
+
+function sendDown(X, Y, p) {
+  const b = ui.rightArmed ? 'right' : 'left';
+  send(`{"t":"down","x":${X},"y":${Y},"p":${p},"tx":${tx},"ty":${ty},"b":"${b}"}`);
+  stroke = true; lastX = X; lastY = Y;
+  if (ui.rightArmed) setRight(false);   // only a real down uses up the right-click
+}
+
+// The tip crossed the threshold (or Aim is off): click here with the real pressure.
+function pressAt(x, y, p) {
+  const X = normX(x), Y = normY(y);
+  aiming = false; aimPending = false;
+  if (ready) sendDown(X, Y, p);
+  lastSX = area.x + X * area.w; lastSY = area.y + Y * area.h;
+  qv(DOWN, lastSX, lastSY, p, x, y, tiltMag());
+}
+
+// Below the threshold: the cursor follows, one hover per event.
+function flushAim() {
+  if (!aimPending) return;
+  aimPending = false;
+  const X = normX(aimX), Y = normY(aimY);
+  if (ready && inArea(aimX, aimY)) send(`{"t":"hover","x":${X},"y":${Y}}`);   // outside the area only the reticle follows
+  qv(AIM, area.x + X * area.w, area.y + Y * area.h, aimP, aimX, aimY, Math.min(1, aimP / aimAt()));
+}
+
 function onDown(e) {
   if (e.pointerType !== 'pen' || penId !== -1) return;
   const x = e.clientX, y = e.clientY;
   if (!inArea(x, y)) return;
-  penId = e.pointerId;
-  const X = normX(x), Y = normY(y), p = pressure(e);
+  penId = e.pointerId; hoverStart = 0; hoverCount = 0;
+  const p = pressure(e);
+  notePressure(p);
   readTilt(e);
-  if (ready) {
-    const b = ui.rightArmed ? 'right' : 'left';
-    send(`{"t":"down","x":${X},"y":${Y},"p":${p},"tx":${tx},"ty":${ty},"b":"${b}"}`);
-    stroke = true; lastX = X; lastY = Y;
-    if (ui.rightArmed) setRight(false);
-  }
   e.preventDefault();
   try { surface.setPointerCapture(penId); } catch (_) {}
-  lastSX = area.x + X * area.w; lastSY = area.y + Y * area.h;
-  qv(DOWN, lastSX, lastSY, p, x, y, tiltMag());
+  if (p >= aimAt()) pressAt(x, y, p);
+  else { aiming = true; aimX = x; aimY = y; aimP = p; aimPending = true; flushAim(); }
   if (!body.classList.contains('drawn')) body.classList.add('drawn');
+}
+
+function contactPoint(ev) {
+  if (aiming) {
+    const p = pressure(ev);
+    readTilt(ev);
+    if (p >= aimAt() && inArea(ev.clientX, ev.clientY)) { pressAt(ev.clientX, ev.clientY, p); return; }   // clicks start inside the area
+    aimX = ev.clientX; aimY = ev.clientY; aimP = p; aimPending = true;
+    return;
+  }
+  movePoint(ev);
 }
 
 function movePoint(ev) {
   const x = ev.clientX, y = ev.clientY, X = normX(x), Y = normY(y), p = pressure(ev);
+  notePressure(p);
   readTilt(ev);
   if (stroke) {
     send(`{"t":"move","x":${X},"y":${Y},"p":${p},"tx":${tx},"ty":${ty}}`);
@@ -130,33 +187,46 @@ function onMove(e) {
   if (e.pointerId === penId) {
     if (e.buttons === 0) { onUp(e); return; }   // lifted without a pointerup: release now
     const list = hasCoalesced ? e.getCoalescedEvents() : null;
-    if (list && list.length) for (let i = 0; i < list.length; i++) movePoint(list[i]);
-    else movePoint(e);
+    if (list && list.length) for (let i = 0; i < list.length; i++) contactPoint(list[i]);
+    else contactPoint(e);
+    flushAim();
     return;
   }
   if (penId !== -1 || e.buttons !== 0) return;
   const x = e.clientX, y = e.clientY;
   if (ready && inArea(x, y)) send(`{"t":"hover","x":${normX(x)},"y":${normY(y)}}`);
   qv(HOVER, x, y, 0, x, y, 0);
+  noteHover();
 }
 
 function onUp(e) {
   if (e.pointerId !== penId) return;
   if (e.type === 'pointerup' || e.type === 'pointermove') { lastX = normX(e.clientX); lastY = normY(e.clientY); }
-  if (stroke) send(`{"t":"up","x":${lastX},"y":${lastY}}`);
-  stroke = false; penId = -1;
+  if (stroke) send(`{"t":"up","x":${lastX},"y":${lastY}}`);   // an aim-only touch sends nothing on lift
+  stroke = false; penId = -1; aiming = false; aimPending = false; hoverStart = 0; hoverCount = 0;
   qv(UP, lastSX, lastSY, 0, e.clientX || lastSX, e.clientY || lastSY, 0);
 }
 
+// Hardware hover (Pencil above the glass) is noted on the Aim chip once seen; nothing is sent for it.
+function noteHover() {
+  if (aimBtn.classList.contains('hover')) return;
+  const now = performance.now();
+  if (!hoverStart) hoverStart = now;
+  if (++hoverCount < 3 || now - hoverStart < HOVER_CONFIRM_MS) return;
+  aimBtn.classList.add('hover');
+  aimBtn.title = aimTitle();
+  store.set('hoverSeen', '1');
+}
+
 function onLeave(e) {
-  if (e.pointerType === 'pen' && penId === -1) qv(LEAVE, 0, 0, 0, 0, 0, 0);
+  if (e.pointerType === 'pen' && penId === -1) { hoverStart = 0; hoverCount = 0; qv(LEAVE, 0, 0, 0, 0, 0, 0); }
 }
 
 // Close any open stroke: hidden page, lost focus, socket teardown.
 function releaseStroke() {
   if (stroke) send(`{"t":"up","x":${lastX},"y":${lastY}}`);
   if (penId !== -1) qv(UP, lastSX, lastSY, 0, lastSX, lastSY, 0);
-  stroke = false; penId = -1;
+  stroke = false; penId = -1; aiming = false; aimPending = false;
 }
 
 function tiltMag() { return Math.min(90, Math.hypot(tx, ty)); }
@@ -360,6 +430,28 @@ styleBtn.addEventListener('click', () => {
 
 $('clear').addEventListener('click', () => { if (fx) fx.clear(); });
 
+let aimMode = AIM_MODES.includes(store.get('aim')) ? store.get('aim') : 'soft';
+function aimTitle() {
+  const what = aimMode === 'off' ? 'Aim off: every Pencil touch clicks'
+    : !pressureSeen ? `Aim ${AIM_NAMES[aimMode]} waits for Pencil pressure: until this Pencil reports pressure, every touch clicks`
+    : `Aim ${AIM_NAMES[aimMode]}: a light touch moves the cursor, press harder to click`;
+  return aimBtn.classList.contains('hover') ? what + ' (this Pencil hovers)' : what;
+}
+function applyAim() {
+  aimName.textContent = AIM_NAMES[aimMode];
+  aimBtn.dataset.mode = aimMode;
+  aimBtn.classList.toggle('nopressure', !pressureSeen && aimMode !== 'off');
+  aimBtn.title = aimTitle();
+  aimBtn.setAttribute('aria-label', aimBtn.title);
+  store.set('aim', aimMode);
+}
+aimBtn.addEventListener('click', () => {
+  aimMode = AIM_MODES[(AIM_MODES.indexOf(aimMode) + 1) % AIM_MODES.length];
+  applyAim();
+});
+if (store.get('hoverSeen')) aimBtn.classList.add('hover');
+pressureSeen = store.get('pressureSeen') === '1';
+
 const de = document.documentElement;
 const requestFS = de.requestFullscreen || de.webkitRequestFullscreen;
 const exitFS = document.exitFullscreen || document.webkitExitFullscreen;
@@ -396,6 +488,7 @@ addEventListener('orientationchange', () => requestAnimationFrame(fit));
 // ---------- Start ----------
 
 applyStyle();
+applyAim();
 fit();
 connect();
 

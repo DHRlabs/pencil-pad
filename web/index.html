@@ -32,7 +32,7 @@
     <span id="area-label"></span>
     <div id="hint">
       <strong>Draw with Apple Pencil</strong>
-      <span>Fingers only tap buttons</span>
+      <span>Touch lightly to aim, press to click. Fingers only tap buttons.</span>
     </div>
   </div>
 
@@ -51,6 +51,10 @@
     <button type="button" class="tool text" data-key="escape" title="Escape" aria-label="Escape">esc</button>
     <button type="button" class="tool" id="rclick" title="Right-click the next Pencil tap" aria-label="Right-click next tap" aria-pressed="false">
       <svg viewBox="0 0 24 24"><rect x="6" y="3" width="12" height="18" rx="6"/><path d="M12 3v7"/><path class="fill" d="M12 3.2a5.8 5.8 0 0 1 5.8 5.8v1H12z"/></svg>
+    </button>
+    <button type="button" class="tool wide" id="aim" title="Aim" aria-label="Aim: light touch moves, firm press clicks">
+      <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="6.5"/><circle class="core" cx="12" cy="12" r="2.2"/><path d="M12 2.5v3M12 18.5v3M2.5 12h3M18.5 12h3"/></svg>
+      <span id="aim-name">Soft</span><i class="hoverdot"></i>
     </button>
     <span class="sep"></span>
     <button type="button" class="tool wide" id="style" title="Effects style" aria-label="Effects style">
