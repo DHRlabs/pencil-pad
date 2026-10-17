@@ -21,10 +21,12 @@
   }
 }
 </script>
+<script src="board-core.js"></script>
 <script type="module" src="app.js"></script>
 </head>
 <body data-style="neon" data-conn="connecting">
   <canvas id="fx" aria-hidden="true"></canvas>
+  <canvas id="ink" aria-hidden="true"></canvas>
   <div id="surface" aria-label="Drawing surface"></div>
 
   <div id="area" aria-hidden="true">
@@ -40,33 +42,90 @@
     <div class="status keep" title="Connection">
       <span class="dot"></span><span id="status-text">Connecting</span>
     </div>
+    <div id="modes" class="seg" role="group" aria-label="Mode">
+      <button type="button" class="tool wide" data-m="mouse" title="Mouse: the Pencil moves and clicks the Mac cursor" aria-label="Mouse mode" aria-pressed="true">
+        <svg viewBox="0 0 24 24"><path d="m5 4 6.5 15 2-6.5L20 10.5 5 4Z"/></svg>
+        <span>Mouse</span>
+      </button>
+      <button type="button" class="tool wide" data-m="board" title="Board: draw in a window on the Mac that you can share" aria-label="Board mode" aria-pressed="false">
+        <svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="12.5" rx="2"/><path d="m9 20h6M12 16.5V20"/><path d="m8.5 12 2.5-4 2 3 1.5-2 1.5 3" stroke-width="1.6"/></svg>
+        <span>Board</span>
+      </button>
+    </div>
+    <span class="sep"></span>
     <div id="targets" class="group" role="group" aria-label="Target screen"></div>
-    <span class="sep"></span>
-    <button type="button" class="tool" data-key="undo" title="Undo (Cmd Z)" aria-label="Undo">
-      <svg viewBox="0 0 24 24"><path d="M9 14 4 9l5-5"/><path d="M4 9h10.5a5.5 5.5 0 0 1 0 11H11"/></svg>
-    </button>
-    <button type="button" class="tool" data-key="redo" title="Redo (Cmd Shift Z)" aria-label="Redo">
-      <svg viewBox="0 0 24 24"><path d="m15 14 5-5-5-5"/><path d="M20 9H9.5a5.5 5.5 0 0 0 0 11H13"/></svg>
-    </button>
-    <button type="button" class="tool text" data-key="escape" title="Escape" aria-label="Escape">esc</button>
-    <button type="button" class="tool" id="rclick" title="Right-click the next Pencil tap" aria-label="Right-click next tap" aria-pressed="false">
-      <svg viewBox="0 0 24 24"><rect x="6" y="3" width="12" height="18" rx="6"/><path d="M12 3v7"/><path class="fill" d="M12 3.2a5.8 5.8 0 0 1 5.8 5.8v1H12z"/></svg>
-    </button>
-    <button type="button" class="tool wide" id="aim" title="Aim" aria-label="Aim: light touch moves, firm press clicks">
-      <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="6.5"/><circle class="core" cx="12" cy="12" r="2.2"/><path d="M12 2.5v3M12 18.5v3M2.5 12h3M18.5 12h3"/></svg>
-      <span id="aim-name">Soft</span><i class="hoverdot"></i>
-    </button>
-    <span class="sep"></span>
-    <button type="button" class="tool wide" id="style" title="Effects style" aria-label="Effects style">
-      <span class="swatch"></span><span id="style-name">Neon</span>
-    </button>
-    <button type="button" class="tool" id="clear" title="Clear trails" aria-label="Clear trails">
-      <svg viewBox="0 0 24 24"><path d="M20 20H9"/><path d="m4.6 15.4 9.9-9.9a2 2 0 0 1 2.8 0l2.2 2.2a2 2 0 0 1 0 2.8L11 19H8.2l-3.6-3.6"/><path d="m9.5 10.5 5 5"/></svg>
-    </button>
-    <button type="button" class="tool" id="fs" title="Full screen" aria-label="Full screen" hidden>
-      <svg class="on" viewBox="0 0 24 24"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></svg>
-      <svg class="off" viewBox="0 0 24 24"><path d="M9 4v5H4M15 4v5h5M9 20v-5H4M15 20v-5h5"/></svg>
-    </button>
+    <span class="sep" id="targets-sep"></span>
+    <div id="mouse-tools" class="group">
+      <button type="button" class="tool" data-key="undo" title="Undo (Cmd Z)" aria-label="Undo">
+        <svg viewBox="0 0 24 24"><path d="M9 14 4 9l5-5"/><path d="M4 9h10.5a5.5 5.5 0 0 1 0 11H11"/></svg>
+      </button>
+      <button type="button" class="tool" data-key="redo" title="Redo (Cmd Shift Z)" aria-label="Redo">
+        <svg viewBox="0 0 24 24"><path d="m15 14 5-5-5-5"/><path d="M20 9H9.5a5.5 5.5 0 0 0 0 11H13"/></svg>
+      </button>
+      <button type="button" class="tool text" data-key="escape" title="Escape" aria-label="Escape">esc</button>
+      <button type="button" class="tool" id="rclick" title="Right-click the next Pencil tap" aria-label="Right-click next tap" aria-pressed="false">
+        <svg viewBox="0 0 24 24"><rect x="6" y="3" width="12" height="18" rx="6"/><path d="M12 3v7"/><path class="fill" d="M12 3.2a5.8 5.8 0 0 1 5.8 5.8v1H12z"/></svg>
+      </button>
+      <button type="button" class="tool wide" id="aim" title="Aim" aria-label="Aim: light touch moves, firm press clicks">
+        <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="6.5"/><circle class="core" cx="12" cy="12" r="2.2"/><path d="M12 2.5v3M12 18.5v3M2.5 12h3M18.5 12h3"/></svg>
+        <span id="aim-name">Soft</span><i class="hoverdot"></i>
+      </button>
+      <span class="sep"></span>
+      <button type="button" class="tool wide" id="style" title="Effects style" aria-label="Effects style">
+        <span class="swatch"></span><span id="style-name">Neon</span>
+      </button>
+      <button type="button" class="tool" id="clear" title="Clear trails" aria-label="Clear trails">
+        <svg viewBox="0 0 24 24"><path d="M20 20H9"/><path d="m4.6 15.4 9.9-9.9a2 2 0 0 1 2.8 0l2.2 2.2a2 2 0 0 1 0 2.8L11 19H8.2l-3.6-3.6"/><path d="m9.5 10.5 5 5"/></svg>
+      </button>
+      <button type="button" class="tool" id="fs" title="Full screen" aria-label="Full screen" hidden>
+        <svg class="on" viewBox="0 0 24 24"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></svg>
+        <svg class="off" viewBox="0 0 24 24"><path d="M9 4v5H4M15 4v5h5M9 20v-5H4M15 20v-5h5"/></svg>
+      </button>
+    </div>
+    <div id="board-tools" class="group">
+      <button type="button" class="tool" data-b="pen" title="Pen" aria-label="Pen">
+        <svg viewBox="0 0 24 24"><path d="m4 20 .8-3.2L16.6 5a1.8 1.8 0 0 1 2.6 0l-.2-.2a1.8 1.8 0 0 1 0 2.6L7.2 19.2 4 20Z"/><path d="m14.5 7 2.5 2.5"/></svg>
+      </button>
+      <button type="button" class="tool" data-b="marker" title="Marker" aria-label="Marker">
+        <svg viewBox="0 0 24 24"><path d="m5 19h14" stroke-width="2.6"/><path d="m7 15.5h10" stroke-width="2.6" opacity=".6"/></svg>
+      </button>
+      <button type="button" class="tool" data-b="eraser" title="Eraser: drag over strokes" aria-label="Eraser">
+        <svg viewBox="0 0 24 24"><path d="m4.6 15.4 9.9-9.9a2 2 0 0 1 2.8 0l2.2 2.2a2 2 0 0 1 0 2.8L12 20H8.2l-3.6-3.6"/><path d="M12 20h8"/></svg>
+      </button>
+      <span class="sep"></span>
+      <button type="button" class="sw" data-c="#ffffff" aria-label="White color"><i style="background:#fff"></i></button>
+      <button type="button" class="sw" data-c="#000000" aria-label="Black color"><i style="background:#000"></i></button>
+      <button type="button" class="sw" data-c="#ff453a" aria-label="Red color"><i style="background:#ff453a"></i></button>
+      <button type="button" class="sw" data-c="#ff9f0a" aria-label="Orange color"><i style="background:#ff9f0a"></i></button>
+      <button type="button" class="sw" data-c="#ffd60a" aria-label="Yellow color"><i style="background:#ffd60a"></i></button>
+      <button type="button" class="sw" data-c="#32d74b" aria-label="Green color"><i style="background:#32d74b"></i></button>
+      <button type="button" class="sw" data-c="#0a84ff" aria-label="Blue color"><i style="background:#0a84ff"></i></button>
+      <button type="button" class="sw" data-c="#bf5af2" aria-label="Purple color"><i style="background:#bf5af2"></i></button>
+      <span class="sep"></span>
+      <button type="button" class="tool sz" data-s="0.0028" title="Small" aria-label="Small size"><svg viewBox="0 0 24 24"><circle class="dot" cx="12" cy="12" r="3"/></svg></button>
+      <button type="button" class="tool sz" data-s="0.0048" title="Medium" aria-label="Medium size"><svg viewBox="0 0 24 24"><circle class="dot" cx="12" cy="12" r="4.6"/></svg></button>
+      <button type="button" class="tool sz" data-s="0.0078" title="Large" aria-label="Large size"><svg viewBox="0 0 24 24"><circle class="dot" cx="12" cy="12" r="6.4"/></svg></button>
+      <span class="sep"></span>
+      <button type="button" class="tool" data-b="undo" title="Undo stroke" aria-label="Undo stroke">
+        <svg viewBox="0 0 24 24"><path d="M9 14 4 9l5-5"/><path d="M4 9h10.5a5.5 5.5 0 0 1 0 11H11"/></svg>
+      </button>
+      <button type="button" class="tool" data-b="redo" title="Redo stroke" aria-label="Redo stroke">
+        <svg viewBox="0 0 24 24"><path d="m15 14 5-5-5-5"/><path d="M20 9H9.5a5.5 5.5 0 0 0 0 11H13"/></svg>
+      </button>
+      <button type="button" class="tool" data-b="clear" title="Clear board" aria-label="Clear board">
+        <svg viewBox="0 0 24 24"><path d="M4.5 7h15"/><path d="M9.5 7V4.5h5V7"/><path d="m6.5 7 .9 11.6a2 2 0 0 0 2 1.9h5.2a2 2 0 0 0 2-1.9L17.5 7"/><path d="M10 11v6M14 11v6"/></svg>
+      </button>
+      <button type="button" class="tool" data-b="bg" title="Background: dark, white, grid, dots" aria-label="Board background">
+        <svg viewBox="0 0 24 24"><rect x="3.5" y="3.5" width="17" height="17" rx="3"/><path d="M3.5 9.2h17M3.5 14.8h17M9.2 3.5v17M14.8 3.5v17"/></svg>
+      </button>
+      <span class="sep"></span>
+      <button type="button" class="tool" data-b="copy" title="Copy the board to the Mac clipboard" aria-label="Copy board">
+        <svg viewBox="0 0 24 24"><rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 4H6a2 2 0 0 0-2 2v10"/></svg>
+      </button>
+      <button type="button" class="tool" data-b="save" title="Save the board on the Mac Desktop" aria-label="Save board">
+        <svg viewBox="0 0 24 24"><path d="M12 4v10"/><path d="m8 10.5 4 4 4-4"/><path d="M5 19h14"/></svg>
+      </button>
+    </div>
     <button type="button" class="tool keep" id="tuck" title="Hide toolbar" aria-label="Hide toolbar">
       <svg viewBox="0 0 24 24"><path d="m6 15 6-6 6 6"/></svg>
     </button>
@@ -89,6 +148,9 @@
       <button type="button" id="takeover" class="big">Use here</button>
     </div>
   </div>
+
+  <button type="button" id="breopen" hidden>Board window closed on Mac, tap to reopen</button>
+  <div id="toast" role="status"></div>
 
   <div id="insets" aria-hidden="true"></div>
 </body>

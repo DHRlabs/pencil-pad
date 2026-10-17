@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PencilPad Board</title>
+<link rel="icon" href="data:,">
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #07080d; }
+  body { -webkit-user-select: none; user-select: none; cursor: default; }
+  canvas { position: fixed; display: block; pointer-events: none; }
+</style>
+</head>
+<body>
+<canvas id="ink"></canvas>
+<!-- Classic scripts on purpose: a WKWebView will not run ES modules from a file:// page. -->
+<script src="board-core.js"></script>
+<script>
+// PencilPad Board window (Mac, WKWebView): shows what the Pencil draws and nothing else, so the
+// window can be shared as is. The iPad owns the board; this page only applies the ink messages it
+// is handed, through the same board-core.js the iPad draws with.
+(() => {
+  const { createBoard, createView, render } = PencilBoardCore;
+
+  const canvas = document.getElementById('ink');
+  const ctx = canvas.getContext('2d', { alpha: false });
+  const board = createBoard();
+  const view = createView();
+  let timer = 0, lastDraw = 0;
+
+  document.addEventListener('contextmenu', (e) => e.preventDefault());
+
+  // Draw at most about every 12 ms however many messages arrived (a replay is thousands of them).
+  // A timer rather than requestAnimationFrame on purpose: WebKit pauses animation frames for a window
+  // it considers hidden or covered, and a shared window must keep showing the live board anyway.
+  function schedule() {
+    if (timer) return;
+    timer = setTimeout(() => { timer = 0; draw(); }, Math.max(0, 12 - (performance.now() - lastDraw)));
+  }
+
+  function draw() {
+    lastDraw = performance.now();
+    if (canvas.width > 0 && canvas.height > 0) view.draw(board, ctx, canvas.width, canvas.height);
+  }
+
+  // Keep the board 16:9: the largest such rectangle that fits the window, centered.
+  function resize() {
+    const dpr = Math.min(2, window.devicePixelRatio || 1);
+    const W = window.innerWidth, H = window.innerHeight;
+    let w = W, h = W * 9 / 16;
+    if (h > H) { h = H; w = H * 16 / 9; }
+    const cssW = Math.max(1, Math.round(w)), cssH = Math.max(1, Math.round(h));
+    canvas.style.left = Math.round((W - cssW) / 2) + 'px';
+    canvas.style.top = Math.round((H - cssH) / 2) + 'px';
+    canvas.style.width = cssW + 'px';
+    canvas.style.height = cssH + 'px';
+    canvas.width = Math.round(cssW * dpr);
+    canvas.height = Math.round(cssH * dpr);
+    draw();
+  }
+
+  window.PencilBoard = {
+    // One ink or bg message, exactly as the Mac received it from the page.
+    apply(msg) {
+      if (!msg || typeof msg !== 'object') return;
+      if (msg.t === 'board' && msg.op !== 'bg') return;   // open, close, copy, save, state are not board content
+      board.apply(msg);
+      schedule();
+    },
+    // The whole board as a PNG data URL at 3840x2160, for copy and save on the Mac.
+    png() {
+      return new Promise((resolve, reject) => {
+        try {
+          const off = document.createElement('canvas');
+          off.width = 3840; off.height = 2160;
+          render(board, off.getContext('2d'), 3840, 2160);
+          resolve(off.toDataURL('image/png'));
+        } catch (err) { reject(err); }
+      });
+    },
+  };
+
+  window.addEventListener('resize', resize);
+  resize();
+
+  // Ask the iPad page (through the Mac) for reset, background and every stroke. Posted just after the
+  // load event so the Mac has marked the page loaded before the answer can come back. In a plain
+  // browser there is no bridge and the board simply starts empty.
+  window.addEventListener('load', () => {
+    setTimeout(() => {
+      window.webkit?.messageHandlers?.pencilpad?.postMessage({ op: 'replay' });
+    }, 100);
+  });
+})();
+</script>
+</body>
+</html>

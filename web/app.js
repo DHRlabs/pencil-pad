@@ -2,6 +2,11 @@
 // Effects live in fx.js and load after this file, so input never waits on three.js.
 // Wire protocol: see AGENTS.md at the repo root.
 
+// board-core.js is a classic script loaded by index.html before this module (see its header). If it
+// failed to load, Board is switched off and Mouse mode runs exactly as before.
+const core = globalThis.PencilBoardCore || null;
+const { createBoard, createView, BGS } = core || {};
+
 const WS_PORT = 8711;
 const PING_MS = 500;
 const DEAD_MS = 3000;     // no frame from the Mac for this long while connected: reconnect
@@ -39,6 +44,9 @@ const area = { x: 0, y: 0, w: 1, h: 1 };
 const ui = { area, rightArmed: false };
 
 let ws = null, ready = false, halted = '';   // halted: '' | 'denied' | 'replaced'
+let boardOpen = null;        // Board window state the Mac reported on this connection (it sends one after every hello); null = not heard yet
+let stateOnConn = false;     // the Mac has reported the window state on this connection
+let replayAnswered = false;  // this page has answered a replay request on this connection
 let backoff = 500, retryTimer = 0, pingTimer = 0, lastRx = 0;
 let screens = [], target = null;
 let penId = -1, stroke = false, lastX = 0, lastY = 0, lastSX = 0, lastSY = 0;
@@ -91,12 +99,15 @@ function fit() {
   const top = Math.max(bar.getBoundingClientRect().bottom, it) + GAP;
   const left = il + PAD, right = W - ir - PAD, bottom = H - ib - PAD;
   const aw = Math.max(1, right - left), ah = Math.max(1, bottom - top);
-  const aspect = target && target.w > 0 && target.h > 0 ? target.w / target.h : cachedAspect();
+  const aspect = mode === 'board' ? 16 / 9
+    : target && target.w > 0 && target.h > 0 ? target.w / target.h : cachedAspect();
   let w = aw, h = aw / aspect;
   if (h > ah) { h = ah; w = ah * aspect; }
   area.x = left + (aw - w) / 2; area.y = top + (ah - h) / 2; area.w = w; area.h = h;
   const s = frame.style;
   s.left = area.x + 'px'; s.top = area.y + 'px'; s.width = w + 'px'; s.height = h + 'px';
+  areaLabel.textContent = mode === 'board' ? 'Board · 16:9' : targetLabel();
+  placeInk();
 }
 
 function cachedAspect() {
@@ -154,6 +165,7 @@ function onDown(e) {
   readTilt(e);
   e.preventDefault();
   try { surface.setPointerCapture(penId); } catch (_) {}
+  if (mode === 'board') { boardDown(e, x, y); return; }   // Board: ink, never mouse
   if (p >= aimAt()) pressAt(x, y, p);
   else { aiming = true; aimX = x; aimY = y; aimP = p; aimPending = true; flushAim(); }
   if (!body.classList.contains('drawn')) body.classList.add('drawn');
@@ -186,6 +198,7 @@ function onMove(e) {
   if (e.pointerType !== 'pen') return;
   if (e.pointerId === penId) {
     if (e.buttons === 0) { onUp(e); return; }   // lifted without a pointerup: release now
+    if (mode === 'board') { boardMove(e); return; }   // Board: ink locally, no mouse messages
     const list = hasCoalesced ? e.getCoalescedEvents() : null;
     if (list && list.length) for (let i = 0; i < list.length; i++) contactPoint(list[i]);
     else contactPoint(e);
@@ -194,13 +207,14 @@ function onMove(e) {
   }
   if (penId !== -1 || e.buttons !== 0) return;
   const x = e.clientX, y = e.clientY;
-  if (ready && inArea(x, y)) send(`{"t":"hover","x":${normX(x)},"y":${normY(y)}}`);
+  if (ready && mode === 'mouse' && inArea(x, y)) send(`{"t":"hover","x":${normX(x)},"y":${normY(y)}}`);
   qv(HOVER, x, y, 0, x, y, 0);
   noteHover();
 }
 
 function onUp(e) {
   if (e.pointerId !== penId) return;
+  if (mode === 'board') { boardUp(); return; }
   if (e.type === 'pointerup' || e.type === 'pointermove') { lastX = normX(e.clientX); lastY = normY(e.clientY); }
   if (stroke) send(`{"t":"up","x":${lastX},"y":${lastY}}`);   // an aim-only touch sends nothing on lift
   stroke = false; penId = -1; aiming = false; aimPending = false; hoverStart = 0; hoverCount = 0;
@@ -224,8 +238,9 @@ function onLeave(e) {
 
 // Close any open stroke: hidden page, lost focus, socket teardown.
 function releaseStroke() {
+  if (mode === 'board') boardLift();
   if (stroke) send(`{"t":"up","x":${lastX},"y":${lastY}}`);
-  if (penId !== -1) qv(UP, lastSX, lastSY, 0, lastSX, lastSY, 0);
+  if (penId !== -1 && mode !== 'board') qv(UP, lastSX, lastSY, 0, lastSX, lastSY, 0);
   stroke = false; penId = -1; aiming = false; aimPending = false;
 }
 
@@ -272,7 +287,7 @@ function connect() {
     try { ws.close(); } catch (_) {}
   }
   clearInterval(pingTimer);
-  ready = false;
+  ready = false; macLost();
   if (body.dataset.conn !== 'retry') setConn('connecting', 'Connecting');
   const s = new WebSocket(wsURL);
   ws = s;
@@ -296,7 +311,7 @@ function retry(s) {
   s.onopen = s.onmessage = s.onclose = s.onerror = null;
   try { s.close(); } catch (_) {}
   clearInterval(pingTimer);
-  ready = false; ws = null;
+  ready = false; macLost(); ws = null;
   if (halted) return;
   setConn('retry', 'Reconnecting');
   retryTimer = setTimeout(connect, backoff);
@@ -305,7 +320,7 @@ function retry(s) {
 
 // Denied (wrong link) and replaced (another page took over) both stop retrying.
 function halt(kind, text) {
-  halted = kind; ready = false;
+  halted = kind; ready = false; macLost();
   stroke = false; releaseStroke();   // the Mac already let go; end the stroke on this side only
   clearTimeout(retryTimer); clearInterval(pingTimer);
   setConn(kind, text);
@@ -337,6 +352,9 @@ function onMessage(data) {
       break;
     case 'replaced':
       halt('replaced', 'Open elsewhere');
+      break;
+    case 'board':
+      onBoard(m);
       break;
   }
 }
@@ -377,12 +395,17 @@ function markTarget() {
   }
 }
 
+function targetLabel() {
+  if (!target) return '';
+  const s = screens.find((x) => x.id === target.id);
+  return `${s ? shortName(s) : target.name || 'Window'} · ${Math.round(target.w)}×${Math.round(target.h)}`;
+}
+
 function setTarget(t) {
   if (!t) return;
   target = t;
   if (t.w > 0 && t.h > 0) store.set('aspect', String(t.w / t.h));
   const s = screens.find((x) => x.id === t.id);
-  areaLabel.textContent = `${s ? shortName(s) : t.name || 'Window'} · ${Math.round(t.w)}×${Math.round(t.h)}`;
   markTarget();
   fit();
 }
@@ -485,10 +508,384 @@ $('takeover').addEventListener('click', () => {
 addEventListener('resize', fit);
 addEventListener('orientationchange', () => requestAnimationFrame(fit));
 
+// ---------- Board mode ----------
+
+// The Pencil draws persistent ink on a 16:9 board that mirrors the Mac Board window (web/board.html)
+// through the same board-core.js. The iPad owns the board: it applies every op locally, keeps a
+// snapshot in localStorage, and sends each op to the Mac, which forwards it to the window. While
+// Board is on, no mouse or key message leaves the page.
+
+const COLORS = ['#ffffff', '#000000', '#ff453a', '#ff9f0a', '#ffd60a', '#32d74b', '#0a84ff', '#bf5af2'];
+const SIZES = [['s', 0.0028], ['m', 0.0048], ['l', 0.0078]];   // pen width, fraction of the board width
+const ERASE_R = 0.014;      // eraser reach, fraction of the board width
+const PTS_CAP = 1000;       // most points in one live pts frame (about 26 KB; the limit is 60 KB)
+const ERASE_CAP = 4000;     // most stroke ids in one erase frame
+
+const ink = $('ink'), inkCtx = ink.getContext('2d');
+const breopen = $('breopen'), toastEl = $('toast'), hintEl = $('hint');
+const hintTitle = hintEl.querySelector('strong'), hintText = hintEl.querySelector('span');
+const modeBtns = [...bar.querySelectorAll('[data-m]')];
+const toolBtns = [...bar.querySelectorAll('[data-b="pen"],[data-b="marker"],[data-b="eraser"]')];
+const colorBtns = [...bar.querySelectorAll('[data-c]')], sizeBtns = [...bar.querySelectorAll('[data-s]')];
+const undoBtn = bar.querySelector('[data-b="undo"]'), redoBtn = bar.querySelector('[data-b="redo"]');
+
+let mode = core && store.get('mode') === 'board' ? 'board' : 'mouse';
+if (!core) body.classList.add('noboard');
+try { localStorage.removeItem('pencilpad.boardopen'); } catch (_) {}   // an earlier build remembered the window state; the Mac is the truth now
+let bTool = ['pen', 'marker', 'eraser'].includes(store.get('btool')) ? store.get('btool') : 'pen';
+let bColor = COLORS.includes(store.get('bcolor')) ? store.get('bcolor') : '#ffffff';
+let bSize = SIZES.some(([, v]) => v === Number(store.get('bsize'))) ? Number(store.get('bsize')) : 0.0048;
+
+const board = core ? createBoard() : null, view = core ? createView() : null;
+let bLive = null, bErasing = false;   // open stroke id, eraser drag
+let bPending = [], bErase = new Set();   // points and stroke ids waiting for this frame's flush
+
+const lightBg = () => board.bg === 'white' || board.bg === 'grid';
+// White ink on the white board draws black and black ink on the dark board draws white.
+const inkColor = () => (lightBg() ? (bColor === '#ffffff' ? '#000000' : bColor) : (bColor === '#000000' ? '#ffffff' : bColor));
+
+// ---------- Ink canvas (the board, over the three.js background) ----------
+
+let inkRaf = 0, dirtyUntil = 0;
+const sparks = [];
+let tip = { x: 0, y: 0, on: false, c: '#ffffff' }, lastTip = null;
+
+function placeInk() {
+  const dpr = Math.min(3, window.devicePixelRatio || 1);
+  const s = ink.style;
+  s.left = area.x + 'px'; s.top = area.y + 'px'; s.width = area.w + 'px'; s.height = area.h + 'px';
+  if (mode !== 'board') return;   // the bitmap only matters while Board is showing
+  const w = Math.max(1, Math.round(area.w * dpr)), h = Math.max(1, Math.round(area.h * dpr));
+  if (ink.width !== w || ink.height !== h) { ink.width = w; ink.height = h; }
+  wake(450);   // the frame glides for about 280 ms; keep painting until it settles
+}
+
+// One frame loop: flush this frame's points and erases, then paint. It stops by itself when idle.
+function wake(ms = 0) {
+  dirtyUntil = Math.max(dirtyUntil, performance.now() + ms);
+  if (!inkRaf) inkRaf = requestAnimationFrame(inkFrame);
+}
+
+function inkFrame() {
+  inkRaf = 0;
+  bFlush();
+  drawInk();
+  if (!inkRaf && (sparks.length || performance.now() < dirtyUntil)) inkRaf = requestAnimationFrame(inkFrame);
+}
+
+function drawInk() {
+  const w = ink.width, h = ink.height;
+  if (!w || !h || mode !== 'board') return;
+  view.draw(board, inkCtx, w, h);   // the board itself: identical to the Mac window
+  // A subtle glow at the tip while inking, plus a few motes. Drawn over the board each frame, never into it.
+  const k = w / area.w, light = lightBg();
+  inkCtx.save();
+  inkCtx.globalCompositeOperation = light ? 'source-over' : 'lighter';
+  for (let i = sparks.length - 1; i >= 0; i--) {
+    const p = sparks[i];
+    p.x += p.vx * 0.016; p.y += p.vy * 0.016; p.vy += 50 * 0.016; p.life -= 0.016 * 2.4;
+    if (p.life <= 0) { sparks.splice(i, 1); continue; }
+    inkCtx.globalAlpha = (light ? 0.5 : 0.45) * p.life;
+    inkCtx.fillStyle = p.c;
+    inkCtx.beginPath(); inkCtx.arc(p.x, p.y, (0.8 + 1.8 * p.life) * k, 0, 6.2832); inkCtx.fill();
+  }
+  if (tip.on) {
+    inkCtx.globalAlpha = 1;
+    if (bTool === 'eraser') {
+      inkCtx.strokeStyle = light ? 'rgba(20,24,40,0.55)' : 'rgba(255,255,255,0.6)';
+      inkCtx.lineWidth = Math.max(1, k * 1.2);
+      inkCtx.beginPath(); inkCtx.arc(tip.x, tip.y, ERASE_R * w, 0, 6.2832); inkCtx.stroke();
+    } else {
+      const R = 24 * k, g = inkCtx.createRadialGradient(tip.x, tip.y, 0, tip.x, tip.y, R);
+      g.addColorStop(0, light ? hexA(tip.c, 0.28) : 'rgba(255,255,255,0.42)');
+      g.addColorStop(0.45, hexA(tip.c, light ? 0.12 : 0.2));
+      g.addColorStop(1, hexA(tip.c, 0));
+      inkCtx.fillStyle = g;
+      inkCtx.beginPath(); inkCtx.arc(tip.x, tip.y, R, 0, 6.2832); inkCtx.fill();
+    }
+  }
+  inkCtx.restore();
+}
+
+function hexA(hex, a) {
+  const n = parseInt(hex.slice(1), 16);
+  return `rgba(${(n >> 16) & 255},${(n >> 8) & 255},${n & 255},${a})`;
+}
+
+// Pointer position in ink bitmap pixels.
+const bx = (clientX) => (clientX - area.x) / area.w * ink.width;
+const by = (clientY) => (clientY - area.y) / area.h * ink.height;
+
+function mote(x, y) {
+  if (lastTip && Math.hypot(x - lastTip.x, y - lastTip.y) > 4 && sparks.length < 24) {
+    const a = Math.atan2(y - lastTip.y, x - lastTip.x) + Math.PI + (Math.random() - 0.5);
+    const v = (30 + Math.random() * 90) * (ink.width / area.w);
+    sparks.push({ x, y, vx: Math.cos(a) * v, vy: Math.sin(a) * v - 20, life: 0.9, c: tip.c });
+  }
+  lastTip = { x, y };
+}
+
+// ---------- Board ops: apply locally, remember, send ----------
+
+let saveTimer = 0, saveFailed = false, saveDeferred = false;
+function saveSoon() { clearTimeout(saveTimer); saveTimer = setTimeout(saveNow, 300); }
+function saveNow() {
+  clearTimeout(saveTimer); saveTimer = 0;
+  if (penId !== -1) { saveDeferred = true; return; }   // never stall a stroke; boardLift saves after the Pencil lifts
+  saveDeferred = false;
+  try { localStorage.setItem('pencilpad.board', JSON.stringify(board.toOps())); }
+  catch (_) { if (!saveFailed) { saveFailed = true; toast('Board is too big to keep on this iPad'); } }
+}
+
+function sendOp(o) {
+  send(JSON.stringify(o.op === 'bg' ? { t: 'board', op: 'bg', bg: o.bg } : { t: 'ink', ...o }));
+}
+
+// One board change, everywhere at once: the model here, the snapshot, the Mac.
+function inkOp(o) {
+  board.apply(o);
+  if (ready) sendOp(o);
+  if (o.op !== 'pts' && o.op !== 'begin') saveSoon();   // an open stroke is saved when it ends
+  if (o.op !== 'pts') bUI();
+  wake();
+}
+
+// The Mac window asked for the whole board (it does when its page loads and when a new connection
+// opens the board). The history collapses to exactly what the replay carries, here and there, so undo
+// and redo stay identical on both sides. Between replays one connection keeps its full history.
+function sendReplay() {
+  if (!ready || !board) return;
+  const ops = board.rebase();
+  send('{"t":"ink","op":"reset"}');
+  for (const o of ops) sendOp(o);
+  saveSoon(); bUI(); wake();
+}
+
+// Ask the Mac to show the board window, only because the user tapped Board, the reopen hint, Copy or
+// Save; never on connect. It answers with a state message, and with a replay request when this
+// connection has not replayed into the window's current page load.
+function requestOpen() {
+  send('{"t":"board","op":"open"}');
+}
+
+// Copy and Save only go out once the window is open (the Mac reported open on this connection) and
+// this page has answered a replay request on this connection; otherwise the Mac would export an
+// empty board. If that is not true yet, open it and send the export as soon as it is, or give up
+// after 8 s. A save then waits up to 60 s for the Mac (a first save can sit behind a macOS prompt).
+let pendingExport = null, pendingSave = 0;
+const exportReady = () => ready && stateOnConn && boardOpen === true && replayAnswered;
+
+function exportBoard(what) {
+  if (!ready) { toast('Not connected to the Mac'); return; }
+  if (what === 'save' && pendingSave) return;   // one save at a time
+  if (exportReady()) { sendExport(what); return; }
+  clearTimeout(pendingExport && pendingExport.timer);
+  pendingExport = { what, timer: setTimeout(() => { pendingExport = null; toast('The Board window did not open on the Mac'); }, 8000) };
+  toast('Opening board…');
+  requestOpen();
+}
+
+function checkExport() {
+  if (!pendingExport || !exportReady()) return;
+  clearTimeout(pendingExport.timer);
+  const what = pendingExport.what;
+  pendingExport = null;
+  sendExport(what);
+}
+
+function sendExport(what) {
+  send(`{"t":"board","op":"${what}"}`);
+  if (what !== 'save') return;
+  toast('Saving…', true);   // the done message replaces this
+  pendingSave = setTimeout(() => { pendingSave = 0; toast('The Mac did not confirm the save'); }, 60000);
+}
+
+// The socket is gone: what the Mac window is doing now is unknown until the next hello brings a state.
+function macLost() {
+  stateOnConn = false; replayAnswered = false; boardOpen = null;
+  syncClosed();
+  if (pendingExport) { clearTimeout(pendingExport.timer); pendingExport = null; }
+  if (pendingSave) { clearTimeout(pendingSave); pendingSave = 0; toast('Connection lost during the save'); }
+}
+
+// ---------- Pencil -> ink ----------
+
+const bPressure = (e) => (e.pressure > 0 ? Math.round(e.pressure * 1000) / 1000 : 0.5);   // no pressure: half
+
+function boardDown(e, x, y) {
+  if (!body.classList.contains('drawn')) body.classList.add('drawn');
+  tip = { x: bx(x), y: by(y), on: true, c: inkColor() };
+  lastTip = null;
+  bPending = [];
+  if (bTool === 'eraser') {
+    bErasing = true; bErase.clear();
+    eraseAt(x, y);
+  } else {
+    const id = board.nextId();
+    bLive = id;
+    inkOp({ op: 'begin', id, tool: bTool, color: inkColor(), size: bSize, pts: [[normX(x), normY(y), bPressure(e)]] });
+  }
+  wake(180);
+}
+
+function boardMove(e) {
+  const list = hasCoalesced ? e.getCoalescedEvents() : null;
+  const events = list && list.length ? list : [e];
+  for (const ev of events) {
+    const x = ev.clientX, y = ev.clientY;
+    if (bErasing) eraseAt(x, y);
+    else if (bLive !== null) {
+      const X = normX(x), Y = normY(y), n = bPending.length;
+      if (n ? bPending[n - 1][0] !== X || bPending[n - 1][1] !== Y : true) {
+        bPending.push([X, Y, bPressure(ev)]);
+        mote(bx(x), by(y));
+      }
+    }
+  }
+  tip.x = bx(e.clientX); tip.y = by(e.clientY);
+  wake(180);
+}
+
+function boardUp() {
+  boardLift();
+  penId = -1; hoverStart = 0; hoverCount = 0;   // the mouse path never runs in Board mode
+}
+
+// Finish any open stroke or eraser drag: send what is pending, end the stroke, forget it.
+function boardLift() {
+  bFlush();
+  bErasing = false;
+  if (bLive !== null) { inkOp({ op: 'end', id: bLive }); bLive = null; }
+  bPending = [];
+  tip.on = false;
+  wake(300);   // a last frame or two without the glow
+  if (saveDeferred) saveSoon();
+}
+
+function eraseAt(x, y) {
+  for (const id of board.hitTest(normX(x), normY(y), ERASE_R)) bErase.add(id);
+}
+
+// At most one erase op and one pts op per frame, split only if a frame ever carries a huge batch.
+function bFlush() {
+  if (bErase.size) {
+    const ids = [...bErase];
+    bErase.clear();
+    for (let i = 0; i < ids.length; i += ERASE_CAP) inkOp({ op: 'erase', ids: ids.slice(i, i + ERASE_CAP) });
+  }
+  if (bLive !== null && bPending.length) {
+    const pts = bPending;
+    bPending = [];
+    for (let i = 0; i < pts.length; i += PTS_CAP) inkOp({ op: 'pts', id: bLive, pts: pts.slice(i, i + PTS_CAP) });
+  }
+}
+
+// ---------- Mac -> board messages ----------
+
+function onBoard(m) {
+  if (!board) return;
+  if (m.op === 'replay') {
+    sendReplay();
+    replayAnswered = true;
+    checkExport();
+  } else if (m.op === 'state') {
+    boardOpen = !!m.open;
+    stateOnConn = true;
+    syncClosed();
+    checkExport();
+  } else if (m.op === 'done') {
+    if (m.what === 'save' && pendingSave) { clearTimeout(pendingSave); pendingSave = 0; }
+    if (m.what === 'copy') toast(m.ok ? 'Copied to Mac clipboard' : 'Copy failed');
+    else toast(m.ok ? `Saved to Desktop: ${m.name || 'PencilPad Board.png'}` : 'Save failed');
+  }
+}
+
+function syncClosed() {
+  breopen.hidden = !(mode === 'board' && boardOpen === false);
+}
+
+let toastTimer = 0;
+function toast(msg, sticky = false) {   // sticky: stays until the next toast replaces it
+  toastEl.textContent = msg;
+  toastEl.classList.add('on');
+  clearTimeout(toastTimer);
+  if (!sticky) toastTimer = setTimeout(() => toastEl.classList.remove('on'), 3200);
+}
+
+// ---------- Mode and board toolbar ----------
+
+function setMode(m) {
+  m = m === 'board' && core ? 'board' : 'mouse';
+  if (m === mode) return;
+  mode = m;
+  store.set('mode', mode);
+  if (mode === 'board') {
+    setRight(false);   // a right-click armed for the mouse must not wait behind the board
+    if (ready) requestOpen();
+  }
+  modeUI();
+  fit();
+}
+
+function modeUI() {
+  body.dataset.mode = mode;
+  for (const b of modeBtns) b.setAttribute('aria-pressed', String(b.dataset.m === mode));
+  hintTitle.textContent = mode === 'board' ? 'Draw on the shared Board' : 'Draw with Apple Pencil';
+  hintText.textContent = mode === 'board'
+    ? 'Strokes appear in the Board window on the Mac. Fingers only tap buttons.'
+    : 'Touch lightly to aim, press to click. Fingers only tap buttons.';
+  syncClosed();
+  bUI();
+}
+
+function bUI() {
+  if (!board) return;
+  for (const b of toolBtns) b.classList.toggle('active', b.dataset.b === bTool);
+  for (const b of colorBtns) b.classList.toggle('active', b.dataset.c === bColor);
+  for (const b of sizeBtns) b.classList.toggle('active', +b.dataset.s === bSize);
+  undoBtn.disabled = !board.canUndo();
+  redoBtn.disabled = !board.canRedo();
+  body.classList.toggle('inked', board.strokes.length > 0);
+}
+
+bar.addEventListener('click', (e) => {   // the palm rule above already swallowed any press made while the Pencil is down
+  const b = e.target.closest('[data-m],[data-b],[data-c],[data-s]');
+  if (!b) return;
+  if (b.dataset.m) { setMode(b.dataset.m); return; }
+  if (b.dataset.c) { bColor = b.dataset.c; store.set('bcolor', bColor); bUI(); return; }
+  if (b.dataset.s) { bSize = +b.dataset.s; store.set('bsize', String(bSize)); bUI(); return; }
+  switch (b.dataset.b) {
+    case 'pen': case 'marker': case 'eraser':
+      bTool = b.dataset.b; store.set('btool', bTool); bUI();
+      break;
+    case 'undo': inkOp({ op: 'undo' }); break;
+    case 'redo': inkOp({ op: 'redo' }); break;
+    case 'clear': inkOp({ op: 'clear' }); break;
+    case 'bg': inkOp({ op: 'bg', bg: BGS[(BGS.indexOf(board.bg) + 1) % BGS.length] }); break;
+    case 'copy': case 'save': exportBoard(b.dataset.b); break;
+  }
+});
+
+breopen.addEventListener('click', () => { if (ready) requestOpen(); });
+
+// Keep the snapshot current if the page goes away before the save timer fires.
+addEventListener('pagehide', () => { if (saveTimer || saveDeferred) saveNow(); });
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden' && (saveTimer || saveDeferred)) saveNow(); });
+
+// The board survives reloads: restore the snapshot, closing any stroke the page was in the middle of.
+try {
+  const saved = board ? JSON.parse(store.get('board') || 'null') : null;
+  if (Array.isArray(saved)) {
+    for (const o of saved) board.apply(o);
+    for (const s of board.strokes) board.apply({ op: 'end', id: s.id });
+  }
+} catch (_) { /* a damaged snapshot just starts an empty board */ }
+
 // ---------- Start ----------
 
 applyStyle();
 applyAim();
+modeUI();
 fit();
 connect();
 

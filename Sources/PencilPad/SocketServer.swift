@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import Network
 
@@ -9,6 +10,8 @@ final class Client {
     var ended = false
     let opened = ProcessInfo.processInfo.systemUptime
     var lastFrame = ProcessInfo.processInfo.systemUptime
+    /// The Board window's `pageLoads` when this connection was last asked to replay (-1: never).
+    var boardReplayed = -1
 
     init(id: Int, conn: NWConnection) {
         self.id = id
@@ -31,6 +34,8 @@ final class SocketServer {
     private var watchdog: DispatchSourceTimer?
     private var clients: [Int: Client] = [:]
     private var nextID = 1
+    /// The Board window. Its replies (state, replay requests) go to the active client.
+    private lazy var board = makeBoard()
     /// The one authenticated client. While there is one, App Nap is held off so input never lags.
     private(set) var active: Client? {
         didSet {
@@ -94,6 +99,125 @@ final class SocketServer {
     func pushTarget() {
         guard let c = active else { return }
         send(c, ["t": "target", "target": targets.current.json])
+    }
+
+    // MARK: Board
+
+    private func makeBoard() -> BoardWindow {
+        let board = BoardWindow()
+        board.onReplay = { [weak self] in
+            guard let self, let c = active else { return }
+            askReplay(c)
+        }
+        board.onHidden = { [weak self] in
+            guard let self, let c = active else { return }
+            send(c, ["t": "board", "op": "state", "open": false])
+        }
+        return board
+    }
+
+    /// Asks the iPad page to send the whole board again, and remembers that this connection has it.
+    private func askReplay(_ c: Client) {
+        c.boardReplayed = board.pageLoads
+        send(c, ["t": "board", "op": "replay"])
+    }
+
+    /// Tells a connection where the window stands, and brings its board up to date: whenever the window is
+    /// showing with its page loaded and this connection has not replayed into that page load, it is asked to.
+    /// The one place that decides; login, the open message and the menu all end here.
+    private func reportBoard(to c: Client) {
+        send(c, ["t": "board", "op": "state", "open": board.isShown])
+        if board.isShown, board.loaded, c.boardReplayed != board.pageLoads { askReplay(c) }
+    }
+
+    /// Shows the window and reports it to the active connection. Shared by the open message and the menu.
+    private func presentBoard(raise: Bool = false) {
+        board.show(raise: raise)
+        if let c = active { reportBoard(to: c) }
+    }
+
+    /// Menu bar: show the Board window, in front.
+    func showBoard() {
+        presentBoard(raise: true)
+    }
+
+    private func handleBoard(_ c: Client, _ msg: [String: Any]) {
+        switch msg["op"] as? String {
+        case "open":
+            presentBoard()
+        case "close":
+            board.hide()
+            send(c, ["t": "board", "op": "state", "open": false])
+        case "bg":
+            board.apply(msg)
+        case "copy":
+            exportBoard(c, what: "copy")
+        case "save":
+            exportBoard(c, what: "save")
+        default:
+            log.debug("client \(c.id): unknown board op \(msg["op"] as? String ?? "", privacy: .public)")
+        }
+    }
+
+    /// Every ink message goes to the window unchanged; it applies exactly what the iPad applied.
+    private func forwardInk(_ msg: [String: Any]) {
+        log.debug("board: forwarding ink \(msg["op"] as? String ?? "", privacy: .public)")
+        board.apply(msg)
+    }
+
+    /// Renders the board and copies it or saves it, then reports done to the iPad. A window page that is
+    /// not up, or has not had its reset since it loaded, fails at once; the iPad page opens the window and
+    /// answers the replay before exporting.
+    private func exportBoard(_ c: Client, what: String) {
+        guard board.loaded, board.ready else {
+            let why = board.loaded ? "the window page has not had its reset yet" : "the window page is not loaded"
+            log.notice("board \(what, privacy: .public): failed, \(why, privacy: .public)")
+            send(c, ["t": "board", "op": "done", "what": what, "ok": false, "name": ""])
+            return
+        }
+        Task {
+            var ok = false
+            var name = ""
+            var bytes = 0
+            if let data = await board.png() {
+                bytes = data.count
+                if what == "save" {
+                    do {
+                        // Off the main thread: the first write to the Desktop can sit behind a permission prompt.
+                        name = try await Task.detached { try Self.saveToDesktop(data) }.value
+                        ok = true
+                    } catch {
+                        log.error("board: save failed: \(error.localizedDescription, privacy: .public)")
+                    }
+                } else {
+                    NSPasteboard.general.clearContents()
+                    ok = NSPasteboard.general.setData(data, forType: .png)
+                }
+            }
+            log.notice("board \(what, privacy: .public): \(ok ? "ok" : "failed", privacy: .public), \(bytes) bytes")
+            send(c, ["t": "board", "op": "done", "what": what, "ok": ok, "name": name])
+        }
+    }
+
+    /// Writes the PNG to the Desktop as "PencilPad Board <yyyy-MM-dd at HH.mm.ss>.png" in local time and
+    /// returns the file name. A name that is taken (two saves in one second) gets " 2", " 3" before the
+    /// extension; the write itself refuses to overwrite, so concurrent saves cannot collide.
+    private nonisolated static func saveToDesktop(_ data: Data) throws -> String {
+        let clock = DateFormatter()
+        clock.locale = Locale(identifier: "en_US_POSIX")  // the format is part of the name, not the locale
+        clock.dateFormat = "yyyy-MM-dd 'at' HH.mm.ss"
+        let stem = "PencilPad Board \(clock.string(from: Date()))"
+        let desktop = FileManager.default.urls(for: .desktopDirectory, in: .userDomainMask)[0]
+        var n = 1
+        while true {
+            let name = n == 1 ? "\(stem).png" : "\(stem) \(n).png"
+            do {
+                try data.write(to: desktop.appendingPathComponent(name), options: .withoutOverwriting)
+                return name
+            } catch let error as CocoaError where error.code == .fileWriteFileExists {
+                n += 1
+            }
+        }
     }
 
     // MARK: Connections
@@ -238,6 +362,10 @@ final class SocketServer {
             if let name = msg["name"] as? String { pen.key(name) }
         case "ping":
             send(c, ["t": "pong"])
+        case "board":
+            handleBoard(c, msg)
+        case "ink":
+            forwardInk(msg)
         case "hello":
             break
         default:
@@ -254,6 +382,7 @@ final class SocketServer {
         active = c
         log.notice("hello accepted: client \(c.id)")
         send(c, ["t": "hello", "screens": targets.screens.map(\.json), "target": targets.current.json])
+        reportBoard(to: c)  // the page never relies on a remembered window state
     }
 
     private func deny(_ c: Client, why: String) {

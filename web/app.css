@@ -239,3 +239,111 @@ body.fs #fs .off { display: block; }
   position: fixed; inset: 0; visibility: hidden; pointer-events: none;
   padding: env(safe-area-inset-top, 0px) env(safe-area-inset-right, 0px) env(safe-area-inset-bottom, 0px) env(safe-area-inset-left, 0px);
 }
+
+/* ---------- Board mode ---------- */
+
+/* The ink canvas sits over the effects and under the input surface. app.js keeps it exactly on the
+   active area, which is 16:9 in Board mode. It tracks the area in every mode (so it glides with it)
+   but stays hidden outside Board, and fades in once the frame has finished gliding. */
+#ink {
+  position: fixed; left: 0; top: 0; width: 0; height: 0;
+  border-radius: 4px;
+  pointer-events: none;
+  opacity: 0; visibility: hidden;
+  transition: left .28s cubic-bezier(.2,.8,.2,1), top .28s cubic-bezier(.2,.8,.2,1),
+              width .28s cubic-bezier(.2,.8,.2,1), height .28s cubic-bezier(.2,.8,.2,1),
+              opacity .15s ease, visibility 0s linear .15s;
+}
+body[data-mode="board"] #ink {
+  opacity: 1; visibility: visible;
+  transition: left .28s cubic-bezier(.2,.8,.2,1), top .28s cubic-bezier(.2,.8,.2,1),
+              width .28s cubic-bezier(.2,.8,.2,1), height .28s cubic-bezier(.2,.8,.2,1),
+              opacity .24s ease .26s, visibility 0s linear .26s;
+}
+/* Over the board the frame keeps only its hairline and the dimmed surround; no tint on the ink. */
+body[data-mode="board"] #area { box-shadow: 0 0 0 1px rgb(var(--accent) / .22), 0 0 0 200vmax var(--dim); }
+#hint, #area-label { transition: opacity .6s ease; }
+body[data-mode="board"].inked #hint, body[data-mode="board"].inked #area-label { opacity: 0; }
+
+body[data-mode="board"] #mouse-tools,
+body[data-mode="board"] #targets,
+body[data-mode="board"] #targets-sep { display: none; }
+body:not([data-mode="board"]) #board-tools { display: none; }
+
+/* Mouse | Board switch: one pill, always in the same spot. */
+#bar .seg { display: flex; gap: 0; border-radius: 14px; flex: none; background: rgb(255 255 255 / .05); box-shadow: inset 0 0 0 1px var(--line); }
+#bar .seg button { color: var(--muted); }
+#bar .seg button[aria-pressed="true"] {
+  color: rgb(var(--accent)); background: rgb(var(--accent) / .14);
+  box-shadow: inset 0 0 0 1px rgb(var(--accent) / .4), 0 0 14px rgb(var(--accent) / .18);
+}
+
+/* Board tools. Same glass buttons; colors are small swatch dots. */
+#bar .sw { width: 34px; min-width: 34px; padding: 0; }
+#bar .sw i {
+  display: block; width: 17px; height: 17px; border-radius: 50%;
+  box-shadow: inset 0 0 0 1px rgb(255 255 255 / .25), 0 0 6px rgb(0 0 0 / .3);
+  transition: transform .12s ease, box-shadow .2s ease;
+}
+#bar .sw.active { background: none; box-shadow: none; }
+#bar .sw.active i { transform: scale(1.18); box-shadow: 0 0 0 2px rgb(var(--accent) / .9), 0 0 14px rgb(var(--accent) / .55); }
+#bar .sz { min-width: 38px; padding: 0 6px; }
+#bar .sz .dot { fill: currentColor; stroke: none; }
+#bar button.active { color: rgb(var(--accent)); background: rgb(var(--accent) / .13); box-shadow: inset 0 0 0 1px rgb(var(--accent) / .4); }
+#bar button:disabled { opacity: .35; pointer-events: none; }
+
+/* Board window closed on the Mac: a small tappable reminder over the board. */
+#breopen {
+  position: fixed; z-index: 12; left: 50%; bottom: calc(env(safe-area-inset-bottom, 0px) + 18px);
+  transform: translateX(-50%);
+  appearance: none; -webkit-appearance: none; border: 1px solid rgb(255 181 71 / .5);
+  height: 40px; padding: 0 18px; border-radius: 20px;
+  font: inherit; font-weight: 600; color: #ffd9a0;
+  background: rgb(38 28 12 / .72);
+  -webkit-backdrop-filter: blur(16px); backdrop-filter: blur(16px);
+  box-shadow: 0 8px 30px rgb(0 0 0 / .4), 0 0 18px rgb(255 181 71 / .2);
+  touch-action: manipulation;
+}
+#breopen[hidden] { display: none; }
+#breopen:active { transform: translateX(-50%) scale(.96); }
+
+#toast {
+  position: fixed; z-index: 12; left: 50%; top: calc(env(safe-area-inset-top, 0px) + 74px);
+  transform: translateX(-50%) translateY(-8px);
+  max-width: 80vw; padding: 10px 18px; border-radius: 14px;
+  font-size: 13px; font-weight: 600; color: var(--text);
+  background: var(--glass); border: 1px solid var(--line);
+  -webkit-backdrop-filter: blur(18px); backdrop-filter: blur(18px);
+  box-shadow: 0 10px 34px rgb(0 0 0 / .45);
+  opacity: 0; pointer-events: none;
+  transition: opacity .25s ease, transform .25s ease;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+#toast.on { opacity: 1; transform: translateX(-50%) translateY(0); }
+
+/* Narrow screens. Labels go first; below about a 10 inch landscape the board tools drop to a second row. */
+@media (max-width: 1260px) {
+  body[data-mode="board"] #status-text,
+  body[data-mode="board"] #modes span { display: none; }
+}
+@media (max-width: 900px) {
+  #board-tools .tool { min-width: 40px; padding: 0 4px; }
+  #bar .sw { width: 30px; min-width: 30px; }
+  #bar .sw i { width: 16px; height: 16px; }
+  #bar .sz { min-width: 34px; }
+  #modes span { display: none; }
+  #bar .seg button { min-width: 40px; padding: 0 5px; }
+  #modes + .sep { display: none; }
+}
+@media (max-width: 1060px) {
+  body[data-mode="board"] #bar {
+    flex-wrap: wrap; justify-content: center; row-gap: 3px; box-sizing: border-box;
+    width: calc(100vw - 20px - env(safe-area-inset-left, 0px) - env(safe-area-inset-right, 0px));   /* a fixed box would shrink-wrap to half the screen */
+  }
+  body[data-mode="board"] #board-tools { order: 2; flex: 1 1 100%; justify-content: center; flex-wrap: wrap; row-gap: 2px; }
+  body[data-mode="board"] #tuck { order: 1; }
+  body[data-mode="board"] #modes + .sep { display: none; }
+}
+
+/* board-core.js did not load: Mouse mode only. */
+body.noboard #modes, body.noboard #modes + .sep { display: none; }

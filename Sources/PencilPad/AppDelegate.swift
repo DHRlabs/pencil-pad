@@ -75,6 +75,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             menu.addItem(action("Accessibility: not allowed. Open Settings…", #selector(openAccessibility)))
         }
         menu.addItem(.separator())
+        menu.addItem(action("Show Board", #selector(showBoard)))
         menu.addItem(NSMenuItem(title: "Quit PencilPad", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
     }
 
@@ -110,5 +111,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
             NSWorkspace.shared.open(url)
         }
+    }
+
+    @objc private func showBoard() {
+        socket.showBoard()
     }
 }
