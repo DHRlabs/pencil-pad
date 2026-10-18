@@ -85,6 +85,24 @@ body[data-style="off"] #fx, body.nofx #fx { display: none; }
 #hint span { font-size: 13px; font-weight: 500; color: var(--muted); }
 body.drawn #hint { opacity: 0; }
 
+/* Zoom. While a gesture is armed the frame follows the fingers at once instead of gliding. */
+body.zooming #area { transition: none; }
+#zoomhint {
+  position: absolute; left: 50%; bottom: 22px; transform: translateX(-50%);
+  padding: 9px 16px; border-radius: 14px; white-space: nowrap;
+  font-size: 13px; font-weight: 600; color: rgb(var(--accent));
+  background: var(--glass); border: 1px solid rgb(var(--accent) / .4);
+  -webkit-backdrop-filter: blur(18px); backdrop-filter: blur(18px);
+  opacity: 0; transition: opacity .2s ease;
+}
+body.zoomarmed:not(.zooming) #zoomhint { opacity: 1; }
+/* The zoom level and where the region sits in the target, small, in the corner of the active area. */
+#zoomhud { position: absolute; right: 12px; bottom: 10px; display: none; align-items: center; gap: 8px; opacity: .85; }
+body.zoomed #zoomhud { display: flex; }
+#hud-level { font-size: 11px; font-weight: 600; letter-spacing: .08em; color: rgb(var(--accent) / .8); }
+#minimap { position: relative; border: 1px solid rgb(var(--accent) / .45); border-radius: 3px; background: rgb(255 255 255 / .04); }
+#minimap i { position: absolute; box-sizing: border-box; border: 1.5px solid rgb(var(--accent)); background: rgb(var(--accent) / .22); border-radius: 1px; }
+
 /* Toolbar: one slim glass strip on the top edge, away from a resting palm. */
 #bar {
   position: fixed;
@@ -211,6 +229,11 @@ body.rarmed .corner { border-color: #ffb547; filter: drop-shadow(0 0 7px #ffb547
   background: conic-gradient(from 200deg, rgb(var(--accent)), rgb(var(--accent2)), rgb(var(--accent)));
   box-shadow: 0 0 12px rgb(var(--accent) / .7);
 }
+#bar #zoom.armed {
+  color: rgb(var(--accent)); background: rgb(var(--accent) / .16);
+  box-shadow: inset 0 0 0 1px rgb(var(--accent) / .6), 0 0 20px rgb(var(--accent) / .35);
+  animation: pulse 1s ease-in-out infinite;
+}
 #bar #aim { position: relative; }
 #aim .core { fill: currentColor; stroke: none; opacity: .45; }
 #aim[data-mode="soft"] .core { opacity: .75; }
@@ -244,6 +267,11 @@ body.fs #fs .off { display: block; }
   #bar button, #bar .wide { padding: 0 6px; }
   .status { padding: 0 6px; }
   .sep { margin: 0 2px; }
+}
+
+/* The Zoom button needs room: on the narrowest iPad portrait widths the Mouse tools take 40 px, as the Board tools do. */
+@media (max-width: 800px) {
+  #mouse-tools .tool, #bar #tuck { min-width: 40px; }
 }
 
 /* Wrong link or taken over elsewhere: the socket stops retrying until the person acts. */

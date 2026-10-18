@@ -25,6 +25,8 @@ const AIM_NAMES = { off: 'Off', soft: 'Soft', firm: 'Firm' };
 // A touch wider than this (CSS px across) on the toolbar or the window list is a resting palm, not a fingertip, and does nothing.
 // A guess for a fingertip on iPad glass: it may need tuning on the real iPad.
 const PALM_PX = 30;
+const ZOOM_MIN_W = 1 / 8;    // the most zoomed in: the region is this fraction of the target's width
+const ZOOM_HOLD_MS = 600;    // press and hold Zoom this long to go back to the whole target
 const HOVER_CONFIRM_MS = 100;   // hardware hover counts once 3+ pen hover moves span this long with no touch between
 
 // Visual event queue shared with fx.js: a ring of fixed-size records, no allocation per event.
@@ -38,6 +40,7 @@ const surface = $('surface'), bar = $('bar'), frame = $('area'), areaLabel = $('
 const targetsEl = $('targets'), statusText = $('status-text'), rclickBtn = $('rclick');
 const styleBtn = $('style'), styleName = $('style-name'), fsBtn = $('fs'), insetsEl = $('insets');
 const aimBtn = $('aim'), aimName = $('aim-name'), winMenu = $('winmenu');
+const zoomBtn = $('zoom'), hudLevel = $('hud-level'), miniEl = $('minimap'), miniBox = miniEl.firstElementChild;
 
 const token = location.pathname.split('/').filter(Boolean)[0] || '';
 const wsURL = `ws://${location.hostname}:${WS_PORT}/`;
@@ -52,6 +55,10 @@ let stateOnConn = false;     // the Mac has reported the window state on this co
 let replayAnswered = false;  // this page has answered a replay request on this connection
 let backoff = 500, retryTimer = 0, pingTimer = 0, lastRx = 0;
 let screens = [], target = null;
+const cam = { z: 1, cx: 0.5, cy: 0.5 };    // the zoom camera, see Zoom below
+let region = { x: 0, y: 0, w: 1, h: 1 };   // the part of the target the active area shows, 0 to 1 of the target
+let regionRaf = 0, regionSent = '';        // the animation frame that will send it, and what the Mac last heard
+let regionSaved = '';                      // what localStorage holds for the current target, so it is only written when it changes
 let penId = -1, stroke = false, lastX = 0, lastY = 0, lastSX = 0, lastSY = 0;
 let aiming = false, aimX = 0, aimY = 0, aimP = 0, aimPending = false;   // Pencil touching below the aim threshold
 let hoverStart = 0, hoverCount = 0;
@@ -80,8 +87,11 @@ function qv(type, sx, sy, p, rx, ry, aux) {
 
 const r5 = (v) => Math.round(v * 1e5) / 1e5;
 const clamp01 = (v) => (v < 0 ? 0 : v > 1 ? 1 : v);
-const normX = (x) => r5(clamp01((x - area.x) / area.w));
+const normX = (x) => r5(clamp01((x - area.x) / area.w));   // 0 to 1 across the active area
 const normY = (y) => r5(clamp01((y - area.y) / area.h));
+// Mouse mode sends the Pencil as 0 to 1 of the target: the point in the active area, placed inside the zoomed region.
+const toTargetX = (n) => r5(clamp01(region.x + n * region.w));
+const toTargetY = (n) => r5(clamp01(region.y + n * region.h));
 const inArea = (x, y) => x >= area.x && x <= area.x + area.w && y >= area.y && y <= area.y + area.h;
 const pressure = (e) => Math.round((e.pressure || 0) * 1000) / 1000;
 
@@ -95,23 +105,38 @@ function readTilt(e) {
   tx = Math.round(tx * 10) / 10; ty = Math.round(ty * 10) / 10;
 }
 
-function fit() {
+// What is left of the screen below the toolbar, inside the margins and safe areas.
+function drawRect() {
   const W = innerWidth, H = innerHeight, cs = getComputedStyle(insetsEl);
   const it = parseFloat(cs.paddingTop) || 0, ir = parseFloat(cs.paddingRight) || 0;
   const ib = parseFloat(cs.paddingBottom) || 0, il = parseFloat(cs.paddingLeft) || 0;
   const top = Math.max(bar.getBoundingClientRect().bottom, it) + GAP;
   const left = il + PAD, right = W - ir - PAD, bottom = H - ib - PAD;
-  const aw = Math.max(1, right - left), ah = Math.max(1, bottom - top);
-  const aspect = mode === 'board' ? 16 / 9
-    : target && target.w > 0 && target.h > 0 ? target.w / target.h : cachedAspect();
-  let w = aw, h = aw / aspect;
-  if (h > ah) { h = ah; w = ah * aspect; }
-  area.x = left + (aw - w) / 2; area.y = top + (ah - h) / 2; area.w = w; area.h = h;
+  return { left, top, aw: Math.max(1, right - left), ah: Math.max(1, bottom - top) };
+}
+
+function fit() {
+  const { left, top, aw, ah } = drawRect();
+  let w, h;
+  if (mode === 'board') {
+    h = aw / (16 / 9); w = aw;
+    if (h > ah) { h = ah; w = ah * (16 / 9); }
+    area.x = left + (aw - w) / 2; area.y = top + (ah - h) / 2;
+  } else {
+    // Mouse: the active area is the part of the target the zoom camera sees (see Zoom). Not zoomed, that is the
+    // whole target letterboxed in the drawing area; zoomed in, it grows until it fills the drawing area.
+    const v = clampCam(aw, ah), k = v.S;
+    region = { x: Math.max(0, cam.cx - v.cw / 2), y: Math.max(0, cam.cy - v.ch / 2), w: Math.min(1, v.cw), h: Math.min(1, v.ch) };
+    w = region.w * v.tw * k; h = region.h * v.th * k;
+    area.x = left + aw / 2 + (region.x - cam.cx) * v.tw * k; area.y = top + ah / 2 + (region.y - cam.cy) * v.th * k;
+  }
+  area.w = w; area.h = h;
   const s = frame.style;
   s.left = area.x + 'px'; s.top = area.y + 'px'; s.width = w + 'px'; s.height = h + 'px';
   areaLabel.textContent = mode === 'board' ? 'Board · 16:9' : targetLabel();
   placeInk();
   placeWinMenu();
+  queueRegion();
 }
 
 function cachedAspect() {
@@ -134,7 +159,7 @@ function notePressure(p) {
   applyAim();
 }
 
-function sendDown(X, Y, p) {
+function sendDown(X, Y, p) {   // X, Y: 0 to 1 of the target
   const b = ui.rightArmed ? 'right' : 'left';
   send(`{"t":"down","x":${X},"y":${Y},"p":${p},"tx":${tx},"ty":${ty},"b":"${b}"}`);
   stroke = true; lastX = X; lastY = Y;
@@ -145,7 +170,7 @@ function sendDown(X, Y, p) {
 function pressAt(x, y, p) {
   const X = normX(x), Y = normY(y);
   aiming = false; aimPending = false;
-  if (ready) sendDown(X, Y, p);
+  if (ready) sendDown(toTargetX(X), toTargetY(Y), p);
   lastSX = area.x + X * area.w; lastSY = area.y + Y * area.h;
   qv(DOWN, lastSX, lastSY, p, x, y, tiltMag());
 }
@@ -155,12 +180,12 @@ function flushAim() {
   if (!aimPending) return;
   aimPending = false;
   const X = normX(aimX), Y = normY(aimY);
-  if (ready && inArea(aimX, aimY)) send(`{"t":"hover","x":${X},"y":${Y}}`);   // outside the area only the reticle follows
+  if (ready && inArea(aimX, aimY)) send(`{"t":"hover","x":${toTargetX(X)},"y":${toTargetY(Y)}}`);   // outside the area only the reticle follows
   qv(AIM, area.x + X * area.w, area.y + Y * area.h, aimP, aimX, aimY, Math.min(1, aimP / aimAt()));
 }
 
 function onDown(e) {
-  if (e.pointerType !== 'pen' || penId !== -1) return;
+  if (e.pointerType !== 'pen' || penId !== -1 || zoomPtrs.size) return;   // fingers zooming: the Pencil does nothing to the Mac
   const x = e.clientX, y = e.clientY;
   if (!inArea(x, y)) return;
   penId = e.pointerId; hoverStart = 0; hoverCount = 0;
@@ -191,8 +216,8 @@ function movePoint(ev) {
   notePressure(p);
   readTilt(ev);
   if (stroke) {
-    send(`{"t":"move","x":${X},"y":${Y},"p":${p},"tx":${tx},"ty":${ty}}`);
-    lastX = X; lastY = Y;
+    lastX = toTargetX(X); lastY = toTargetY(Y);
+    send(`{"t":"move","x":${lastX},"y":${lastY},"p":${p},"tx":${tx},"ty":${ty}}`);
   }
   lastSX = area.x + X * area.w; lastSY = area.y + Y * area.h;
   qv(MOVE, lastSX, lastSY, p, x, y, tiltMag());
@@ -211,7 +236,7 @@ function onMove(e) {
   }
   if (penId !== -1 || e.buttons !== 0) return;
   const x = e.clientX, y = e.clientY;
-  if (ready && mode === 'mouse' && inArea(x, y)) send(`{"t":"hover","x":${normX(x)},"y":${normY(y)}}`);
+  if (ready && mode === 'mouse' && !zoomPtrs.size && inArea(x, y)) send(`{"t":"hover","x":${toTargetX(normX(x))},"y":${toTargetY(normY(y))}}`);
   qv(HOVER, x, y, 0, x, y, 0);
   noteHover();
 }
@@ -219,7 +244,7 @@ function onMove(e) {
 function onUp(e) {
   if (e.pointerId !== penId) return;
   if (mode === 'board') { boardUp(); return; }
-  if (e.type === 'pointerup' || e.type === 'pointermove') { lastX = normX(e.clientX); lastY = normY(e.clientY); }
+  if (e.type === 'pointerup' || e.type === 'pointermove') { lastX = toTargetX(normX(e.clientX)); lastY = toTargetY(normY(e.clientY)); }
   if (stroke) send(`{"t":"up","x":${lastX},"y":${lastY}}`);   // an aim-only touch sends nothing on lift
   stroke = false; penId = -1; aiming = false; aimPending = false; hoverStart = 0; hoverCount = 0;
   qv(UP, lastSX, lastSY, 0, e.clientX || lastSX, e.clientY || lastSY, 0);
@@ -337,7 +362,7 @@ function onMessage(data) {
   try { m = JSON.parse(data); } catch (_) { return; }
   switch (m.t) {
     case 'hello':
-      ready = true; backoff = 500;
+      ready = true; backoff = 500; regionSent = '';
       screens = Array.isArray(m.screens) ? m.screens : [];
       setConn('live', 'Connected');
       renderTargets();
@@ -428,9 +453,10 @@ function targetLabel() {
 
 function setTarget(t) {
   if (!t) return;
+  const changed = !target || regionKey(target) !== regionKey(t);
   target = t;
   if (t.w > 0 && t.h > 0) store.set('aspect', String(t.w / t.h));
-  const s = screens.find((x) => x.id === t.id);
+  if (changed) { loadRegion(t); regionSent = ''; }   // that target's own zoom, and the Mac hears it once
   markTarget();
   fit();
 }
@@ -517,13 +543,172 @@ document.addEventListener('pointerdown', (e) => {
   if (e.target === surface) { e.stopPropagation(); e.preventDefault(); }
 }, true);
 
+// ---------- Zoom ----------
+
+// The drawing area is a window onto the target, seen by a camera. cam.z is how far in it looks, with 1 the whole
+// target fitted inside the drawing area (letterboxed, as before); cam.cx and cam.cy are the target point (0 to 1)
+// at the middle of the drawing area. The active area is the part of the target the camera sees, so zooming in
+// is continuous: the letterbox shrinks away, then the active area fills the iPad and the region has the iPad's
+// shape, inside the target. The region is sent to the Mac and kept per target.
+
+function clampCam(aw, ah) {
+  const tw = target && target.w > 0 ? target.w : cachedAspect(), th = target && target.h > 0 ? target.h : 1;
+  const base = Math.min(aw / tw, ah / th);                          // iPad px per target point, whole target fitted
+  const zMax = Math.max(1, aw / (ZOOM_MIN_W * tw * base));          // the region is never narrower than ZOOM_MIN_W of the target
+  cam.z = Math.min(Math.max(cam.z, 1), zMax);
+  const S = cam.z * base, cw = aw / (S * tw), ch = ah / (S * th);   // the camera's size, as fractions of the target
+  cam.cx = cw >= 1 ? 0.5 : Math.min(Math.max(cam.cx, cw / 2), 1 - cw / 2);
+  cam.cy = ch >= 1 ? 0.5 : Math.min(Math.max(cam.cy, ch / 2), 1 - ch / 2);
+  return { tw, th, base, zMax, S, cw, ch };
+}
+
+// Each screen keeps its own region; every window target is just "window", so those are kept per app.
+const regionKey = (t) => (t.id === 'window' && t.app ? 'window:' + t.app : t.id);
+
+// That target's saved region becomes the camera (whole target when there is none).
+function loadRegion(t) {
+  cam.z = 1; cam.cx = cam.cy = 0.5;
+  const raw = store.get('region.' + regionKey(t)) || '';
+  regionSaved = regionKey(t) + '=' + raw;
+  const v = raw.split(',').map(Number);
+  if (v.length !== 4 || !v.every(Number.isFinite)) return;
+  const [x, y, w, h] = v, { aw, ah } = drawRect();
+  const tw = t.w > 0 ? t.w : 1, th = t.h > 0 ? t.h : 1, base = Math.min(aw / tw, ah / th);
+  // A region that spans the whole of one axis says nothing about the camera on it; the other axis does.
+  if (w > 0 && w < 0.999) cam.z = (aw / (base * tw)) / w;
+  else if (h > 0 && h < 0.999) cam.z = (ah / (base * th)) / h;
+  cam.cx = x + w / 2; cam.cy = y + h / 2;
+}
+
+// One region message per animation frame, and only when it changed.
+function queueRegion() { if (!regionRaf) regionRaf = requestAnimationFrame(flushRegion); }
+function flushRegion() {
+  regionRaf = 0;
+  updateZoomUI();
+  if (mode !== 'mouse' || !target) return;
+  const v = [region.x, region.y, region.w, region.h].map(r5), s = v.join(',');
+  const saved = regionKey(target) + '=' + s;
+  if (saved !== regionSaved && !zoomPtrs.size) { regionSaved = saved; store.set('region.' + regionKey(target), s); }   // once, when the fingers lift
+  if (ready && s !== regionSent) {
+    regionSent = s;
+    send(`{"t":"region","x":${v[0]},"y":${v[1]},"w":${v[2]},"h":${v[3]}}`);
+  }
+}
+
+// The level, and a tiny map of where the region sits in the target.
+function updateZoomUI() {
+  const zoomed = cam.z > 1.005, level = `${cam.z.toFixed(1)}×`;
+  body.classList.toggle('zoomed', zoomed);
+  hudLevel.textContent = level;
+  if (!zoomed) return;
+  const tw = target && target.w > 0 ? target.w : cachedAspect(), th = target && target.h > 0 ? target.h : 1;
+  const k = Math.min(64 / tw, 40 / th);   // fits a 64 x 40 box
+  miniEl.style.width = Math.round(tw * k) + 'px'; miniEl.style.height = Math.round(th * k) + 'px';
+  const s = miniBox.style;
+  s.left = region.x * 100 + '%'; s.top = region.y * 100 + '%'; s.width = region.w * 100 + '%'; s.height = region.h * 100 + '%';
+}
+
+// Tapping Zoom arms ONE finger gesture on the drawing surface (fingers otherwise only press buttons): two fingers
+// pinch around their midpoint and drag, one finger drags. When the fingers lift the gesture ends and Zoom disarms.
+let zoomArmed = false;
+const zoomPtrs = new Map();   // finger pointer id -> { x, y }, while a zoom gesture is in progress
+let zoomFrom = null;          // the camera and the fingers when the number of fingers last changed
+let zoomHold = 0, zoomHeld = false, zoomFitRaf = 0;
+
+function armZoom(on) {
+  zoomArmed = on;
+  zoomBtn.classList.toggle('armed', on);
+  zoomBtn.setAttribute('aria-pressed', String(on));
+  body.classList.toggle('zoomarmed', on);
+  if (!on) { zoomPtrs.clear(); zoomFrom = null; body.classList.remove('zooming'); }
+}
+
+function zoomFingers() {
+  const pts = [...zoomPtrs.values()];
+  const mx = pts.reduce((a, p) => a + p.x, 0) / pts.length, my = pts.reduce((a, p) => a + p.y, 0) / pts.length;
+  return { mx, my, d: pts.length > 1 ? Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y) : 0 };
+}
+
+function zoomRebase() { zoomFrom = { z: cam.z, cx: cam.cx, cy: cam.cy, ...zoomFingers() }; }
+
+// The target point that was under the fingers' midpoint when the gesture began stays under it.
+function zoomMove() {
+  if (!zoomFrom || !zoomPtrs.size) return;
+  const f = zoomFingers(), { left, top, aw, ah } = drawRect(), v = clampCam(aw, ah);   // v.base, v.zMax, tw, th
+  const z = Math.min(Math.max(zoomFrom.z * (zoomFrom.d > 0 && f.d > 0 ? f.d / zoomFrom.d : 1), 1), v.zMax);
+  const S0 = zoomFrom.z * v.base, S1 = z * v.base, mx = left + aw / 2, my = top + ah / 2;
+  const ux = zoomFrom.cx + (zoomFrom.mx - mx) / (v.tw * S0), uy = zoomFrom.cy + (zoomFrom.my - my) / (v.th * S0);
+  cam.z = z; cam.cx = ux - (f.mx - mx) / (v.tw * S1); cam.cy = uy - (f.my - my) / (v.th * S1);
+  if (!zoomFitRaf) zoomFitRaf = requestAnimationFrame(() => { zoomFitRaf = 0; fit(); });
+}
+
+// A resting palm is not a zoom finger. Touch radii say so (a contact wider than PALM_PX across); pointer and touch
+// events can come in either order, so the two are matched by where they landed.
+const palms = [];   // recent palm contacts { x, y, at }
+const nearPalm = (x, y) => {
+  const now = performance.now();
+  while (palms.length && now - palms[0].at > 300) palms.shift();
+  return palms.some((p) => Math.hypot(p.x - x, p.y - y) < 6);
+};
+surface.addEventListener('touchstart', (e) => {
+  for (const t of e.changedTouches) {
+    if (!touchPalm(t)) continue;
+    palms.push({ x: t.clientX, y: t.clientY, at: performance.now() });
+    for (const [id, p] of zoomPtrs) if (Math.hypot(p.x - t.clientX, p.y - t.clientY) < 6) zoomPtrs.delete(id);   // its pointerdown came first
+  }
+  if (zoomPtrs.size) zoomRebase();
+  else { zoomFrom = null; body.classList.remove('zooming'); }
+}, { passive: true });
+
+surface.addEventListener('pointerdown', (e) => {
+  if (!zoomArmed || e.pointerType !== 'touch' || penId !== -1 || mode !== 'mouse' || zoomPtrs.size >= 2) return;
+  if (palmSized(e) || nearPalm(e.clientX, e.clientY)) return;
+  zoomPtrs.set(e.pointerId, { x: e.clientX, y: e.clientY });
+  try { surface.setPointerCapture(e.pointerId); } catch (_) {}
+  body.classList.add('zooming');
+  zoomRebase();
+});
+surface.addEventListener('pointermove', (e) => {
+  const p = zoomPtrs.get(e.pointerId);
+  if (!p) return;
+  p.x = e.clientX; p.y = e.clientY;
+  zoomMove();
+});
+function zoomUp(e) {
+  if (!zoomPtrs.delete(e.pointerId)) return;
+  if (zoomPtrs.size) { zoomRebase(); return; }
+  cancelAnimationFrame(zoomFitRaf); zoomFitRaf = 0;
+  armZoom(false);   // the fingers are up: the gesture is over
+  fit();
+}
+for (const t of ['pointerup', 'pointercancel', 'lostpointercapture']) surface.addEventListener(t, zoomUp);
+
+function resetZoom() { cam.z = 1; cam.cx = cam.cy = 0.5; fit(); }
+
+// A tap arms or disarms; a press held for ZOOM_HOLD_MS shows the whole target again. A palm or a Pencil stroke
+// is ignored, as on every toolbar button.
+zoomBtn.addEventListener('pointerdown', () => {
+  zoomHeld = false;
+  clearTimeout(zoomHold);
+  zoomHold = setTimeout(() => {
+    if (penId !== -1 || pressDuringStroke) return;
+    zoomHeld = true; armZoom(false); resetZoom();
+  }, ZOOM_HOLD_MS);
+});
+for (const t of ['pointerup', 'pointercancel', 'pointerleave']) zoomBtn.addEventListener(t, () => clearTimeout(zoomHold));
+zoomBtn.addEventListener('click', () => {
+  if (zoomHeld) { zoomHeld = false; return; }   // that press already did its job
+  armZoom(!zoomArmed);
+});
+
 // ---------- Buttons ----------
 
 // A toolbar press that starts while the Pencil is down is a palm or a slip: swallow it before any button sees it.
 // The same guard covers a palm-sized contact or a second finger: Touch radii are half the contact's size.
 let pressDuringStroke = false;
 const palmSized = (e) => e.pointerType === 'touch' && Math.max(e.width, e.height) > PALM_PX;
-const palmTouch = (e) => e.touches.length > 1 || [...e.changedTouches].some((t) => 2 * Math.max(t.radiusX || 0, t.radiusY || 0) > PALM_PX);
+const touchPalm = (t) => 2 * Math.max(t.radiusX || 0, t.radiusY || 0) > PALM_PX;
+const palmTouch = (e) => e.touches.length > 1 || [...e.changedTouches].some(touchPalm);
 for (const el of [bar, winMenu]) {
   el.addEventListener('pointerdown', (e) => {
     if (e.isPrimary) pressDuringStroke = false;   // a later finger of the same press keeps what the first one decided
@@ -814,6 +999,7 @@ function sendExport(what) {
 // The socket is gone: what the Mac window is doing now is unknown until the next hello brings a state.
 function macLost() {
   closeWinMenu();   // its windows are the old connection's
+  regionSent = '';
   stateOnConn = false; replayAnswered = false; boardOpen = null;
   syncClosed();
   if (pendingExport) { clearTimeout(pendingExport.timer); pendingExport = null; }
@@ -952,6 +1138,7 @@ function setMode(m) {
   if (m === mode) return;
   mode = m;
   closeWinMenu();
+  armZoom(false);
   store.set('mode', mode);
   if (mode === 'board') {
     setRight(false);   // a right-click armed for the mouse must not wait behind the board

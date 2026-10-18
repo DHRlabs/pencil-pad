@@ -36,6 +36,10 @@ final class SocketServer {
     private var nextID = 1
     /// The Board window. Its replies (state, replay requests) go to the active client.
     private lazy var board = makeBoard()
+    /// Shows where the iPad is zoomed to.
+    private lazy var outline = RegionOutline(targets: targets)
+    /// When the Pencil last reached the Mac (a hover, touch, move or lift, or a zoom change).
+    private var lastContact = ProcessInfo.processInfo.systemUptime
     /// The one authenticated client. While there is one, App Nap is held off so input never lags.
     private(set) var active: Client? {
         didSet {
@@ -296,6 +300,7 @@ final class SocketServer {
         if active === c {
             active = nil
             pen.release(reason: "client \(c.id) \(reason)")
+            outline.reset()
         }
         log.notice("client \(c.id) closed: \(reason, privacy: .public)")
         let conn = c.conn
@@ -362,6 +367,12 @@ final class SocketServer {
             send(c, ["t": "target", "target": targets.current.json])  // resized, or gone and now a screen
             if targets.current.id != "window" { return }  // this message was aimed at the vanished window
         }
+        // The Pencil coming back after 10 s away, while zoomed, shows where the iPad is looking.
+        if t == "hover" || t == "down" || t == "move" || t == "up" {
+            let now = ProcessInfo.processInfo.systemUptime
+            if t == "hover" || t == "down", now - lastContact > 10 { outline.flash() }
+            lastContact = now
+        }
         let x = num("x"), y = num("y")
         let at = x.flatMap { x in y.map { y in targets.current.point(x: x, y: y) } }
         let pressure = num("p") ?? 0
@@ -372,7 +383,7 @@ final class SocketServer {
             if let at { pen.hover(at) }
         case "down":
             if let at, let x, let y {
-                pen.down(at, page: CGPoint(x: x, y: y), target: targets.current,
+                pen.down(at, page: CGPoint(x: x, y: y), target: targets.current, region: outline.region ?? CGRect(x: 0, y: 0, width: 1, height: 1),
                          pressure: pressure, tilt: tilt, right: msg["b"] as? String == "right")
             }
         case "move":
@@ -393,6 +404,14 @@ final class SocketServer {
             send(c, ["t": "target", "target": targets.current.json])  // reply even when unchanged, so the page stays in sync
         case "windows":
             send(c, ["t": "windows", "list": targets.windowList()])
+        case "region":
+            // The part of the target the iPad is zoomed to. Pencil coordinates already arrive mapped into it;
+            // the Mac only draws it for a moment.
+            if let rx = x, let ry = y, let rw = num("w"), let rh = num("h") {
+                let w = min(max(rw, 0.01), 1), h = min(max(rh, 0.01), 1)
+                outline.set(CGRect(x: min(max(rx, 0), 1 - w), y: min(max(ry, 0), 1 - h), width: w, height: h))
+                lastContact = ProcessInfo.processInfo.systemUptime  // the outline was just on show
+            }
         case "key":
             if let name = msg["name"] as? String { pen.key(name) }
         case "ping":

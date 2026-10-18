@@ -19,15 +19,18 @@ final class Pen {
         post(.mouseMoved, at: at, button: .left, pressure: 0, tilt: (0, 0))
     }
 
-    func down(_ at: CGPoint, page: CGPoint, target: Target, pressure: Double, tilt: (Double, Double), right: Bool) {
+    /// `region` is the part of the target the iPad shows (0...1 of it, the whole target when not zoomed).
+    func down(_ at: CGPoint, page: CGPoint, target: Target, region: CGRect, pressure: Double, tilt: (Double, Double), right: Bool) {
         if held != nil { release(reason: "down arrived while button held") }
         let button: CGMouseButton = right ? .right : .left
         let now = ProcessInfo.processInfo.systemUptime
-        // Distance in Mac points so it is the same in every direction, whatever the target's aspect ratio.
+        // Distance in Mac points so it is the same in every direction, whatever the target's aspect ratio. The reach
+        // is a fraction of what the iPad shows, in points too, so zooming in shrinks it with the finger-sized steps.
         let w = target.rect.width, h = target.rect.height
+        let shown = max(w * region.width, h * region.height)
         if let prev = lastDown, prev.button == button, prev.target == target,
            now - prev.time <= NSEvent.doubleClickInterval,
-           hypot((page.x - prev.page.x) * w, (page.y - prev.page.y) * h) <= 0.004 * max(w, h) {
+           hypot((page.x - prev.page.x) * w, (page.y - prev.page.y) * h) <= 0.004 * shown {
             clickState += 1
         } else {
             clickState = 1
