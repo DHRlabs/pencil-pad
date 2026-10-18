@@ -4,7 +4,8 @@ import Network
 /// Minimal GET server on 8710. Serves the web root only under /<token>/; everything else is 404.
 @MainActor
 final class HTTPServer {
-    nonisolated static let port: NWEndpoint.Port = 8710
+    /// PENCILPAD_PORT overrides it for test copies; the socket always uses the next port up.
+    nonisolated static let port: NWEndpoint.Port = NWEndpoint.Port(ProcessInfo.processInfo.environment["PENCILPAD_PORT"] ?? "") ?? 8710
 
     private let root: URL?
     private var listener: NWListener?

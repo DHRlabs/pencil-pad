@@ -7,7 +7,7 @@
 const core = globalThis.PencilBoardCore || null;
 const { createBoard, createView, BGS } = core || {};
 
-const WS_PORT = 8711;
+const WS_PORT = Number(location.port || 8710) + 1;   // the socket is always the page port + 1
 const PING_MS = 500;
 const DEAD_MS = 3000;     // no frame from the Mac for this long while connected: reconnect
 const PAD = 14;          // gap between the active area and the screen edges

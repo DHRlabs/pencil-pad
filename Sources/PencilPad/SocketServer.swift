@@ -22,7 +22,7 @@ final class Client {
 /// WebSocket on 8711. Speaks the AGENTS.md protocol; one authenticated client at a time, newest wins.
 @MainActor
 final class SocketServer {
-    nonisolated static let port: NWEndpoint.Port = 8711
+    nonisolated static let port: NWEndpoint.Port = NWEndpoint.Port(rawValue: HTTPServer.port.rawValue + 1)!
     /// Silence that releases a held button.
     static let silenceLimit: TimeInterval = 2
     /// Time allowed to send a valid hello, and silence that closes a logged-in client.
