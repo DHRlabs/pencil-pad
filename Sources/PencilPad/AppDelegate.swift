@@ -106,8 +106,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func pickWindow() {
-        guard targets.select("window") else { return }
-        socket.pushTarget()
+        targets.selectFrontWindow { [weak self] ok in
+            if ok { self?.socket.pushTarget() }
+        }
     }
 
     @objc private func openAccessibility() {

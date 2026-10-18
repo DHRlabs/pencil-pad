@@ -12,6 +12,8 @@ final class Client {
     var lastFrame = ProcessInfo.processInfo.systemUptime
     /// The Board window's `pageLoads` when this connection was last asked to replay (-1: never).
     var boardReplayed = -1
+    /// Input messages waiting, in order, for a fresh window frame before the first touch after a quiet spell (nil: none waiting).
+    var held: [Data]?
 
     init(id: Int, conn: NWConnection) {
         self.id = id
@@ -51,6 +53,9 @@ final class SocketServer {
         })
     /// When the Pencil last reached the Mac (a hover, touch, move or lift, or a zoom change).
     private var lastContact = ProcessInfo.processInfo.systemUptime
+    /// The Pencil has reached the Mac in the last few seconds: only then is a window target's frame read in the background.
+    private var pencilActive = false
+    private static let quietAfter: TimeInterval = 5
     /// The one authenticated client. While there is one, App Nap is held off so input never lags.
     private(set) var active: Client? {
         didSet {
@@ -71,6 +76,7 @@ final class SocketServer {
         self.targets = targets
         self.pen = pen
         targets.onChange = { [weak self] in self?.projection.retarget() }  // a moved or resized window, another target
+        targets.onFollowChange = { [weak self] in self?.pushTarget() }  // the window was resized, or went away
     }
 
     func start() {
@@ -339,6 +345,11 @@ final class SocketServer {
             end(c, reason: "no valid hello within \(Int(Self.idleLimit)) s", closeFrame: true)
         }
         guard let c = active else { return }
+        if pencilActive, pen.held == nil, now - lastContact >= Self.quietAfter {
+            pencilActive = false
+            if targets.current.id == "window" { log.notice("follow: Pencil quiet for \(Int(Self.quietAfter)) s; background window reads paused") }
+        }
+        if pencilActive { targets.followWindow() }  // keeps a window target's frame fresh while the Pencil is in use
         let silent = now - c.lastFrame
         if silent >= Self.idleLimit {
             // A logged-in client silent for 10 s is gone; end() releases any held button first.
@@ -370,21 +381,37 @@ final class SocketServer {
         }
         guard c === active else { return }
 
+        // The first touch after a quiet spell waits for a fresh read of a window target's frame (a window may have moved
+        // while nothing was reading it), and input behind it waits in order. Pings and everything else go on as usual.
+        if c.held != nil, t != "ping" { c.held?.append(data); return }
+        if t == "down", !pencilActive, targets.current.id == "window" {
+            c.held = [data]
+            log.notice("follow: first touch after a quiet spell; reading the window's frame before it")
+            targets.refreshFrame { [weak self] in self?.releaseHeld(c) }
+            Task { [weak self] in
+                try? await Task.sleep(for: .milliseconds(150))  // never wait longer than this for a slow app
+                self?.releaseHeld(c)
+            }
+            return
+        }
+
         /// Wire numbers; anything missing or non-finite counts as absent.
         func num(_ key: String) -> Double? {
             guard let value = (msg[key] as? NSNumber)?.doubleValue, value.isFinite else { return nil }
             return value
         }
-        // A window target follows its window, so its frame is re-read before this message is mapped into it.
-        if t == "hover" || t == "down", targets.followWindow(force: t == "down") {
-            send(c, ["t": "target", "target": targets.current.json])  // resized, or gone and now a screen
-            if targets.current.id != "window" { return }  // this message was aimed at the vanished window
-        }
+        // A window target follows its window. Its frame is read in the background (never on this thread) and applied
+        // when the answer comes back; the periodic tick keeps it fresh even with no hover.
+        if t == "hover" { targets.followWindow() }
         // The Pencil coming back after 10 s away, while zoomed, shows where the iPad is looking.
         if t == "hover" || t == "down" || t == "move" || t == "up" {
             let now = ProcessInfo.processInfo.systemUptime
             if t == "hover" || t == "down", now - lastContact > 10 { outline.flash() }
             lastContact = now
+            if !pencilActive {
+                pencilActive = true
+                if targets.current.id == "window" { log.notice("follow: Pencil active again; background window reads resumed") }
+            }
         }
         let x = num("x"), y = num("y")
         let at = x.flatMap { x in y.map { y in targets.current.point(x: x, y: y) } }
@@ -404,19 +431,32 @@ final class SocketServer {
         case "up":
             if let at { pen.up(at) } else { pen.release(reason: "up without coordinates") }
         case "target":
-            _ = targets.followWindow(force: true)  // the reply carries the window as it is now
-            if let id = msg["id"] as? String {
-                if id == "window", msg["pick"] != nil {
+            targets.followWindow(force: true)  // a fresh read is on its way; a resize is pushed when it lands
+            // Every request is answered with the target, even when nothing changed, so the page stays in sync.
+            // Choosing a window talks to other apps, so its answer comes when that is done; the rest answer now.
+            if let id = msg["id"] as? String, id == "window" {
+                if msg["pick"] != nil {
                     // A pick that is not a whole number cannot name a listed window: nothing changes.
-                    if let n = num("pick").flatMap({ Int(exactly: $0) }) { targets.pick(window: n) }
-                    else { log.error("client \(c.id): window pick is not a whole number") }
+                    if let n = num("pick").flatMap({ Int(exactly: $0) }) {
+                        targets.pick(window: n) { [weak self] _ in self?.replyTarget(c) }
+                    } else {
+                        log.error("client \(c.id): window pick is not a whole number")
+                        replyTarget(c)
+                    }
                 } else {
-                    targets.select(id)
+                    targets.selectFrontWindow { [weak self] _ in self?.replyTarget(c) }
                 }
+            } else {
+                if let id = msg["id"] as? String { targets.select(id) }
+                replyTarget(c)
             }
-            send(c, ["t": "target", "target": targets.current.json])  // reply even when unchanged, so the page stays in sync
         case "windows":
-            send(c, ["t": "windows", "list": targets.windowList()])
+            // Built on the Accessibility queue; pings, hover and down keep flowing meanwhile, and if a newer request
+            // overtakes this one only the newer is answered.
+            targets.requestWindowList { [weak self] list in
+                guard let self, !c.ended, c === active else { return }
+                send(c, ["t": "windows", "list": list])
+            }
         case "region":
             // The part of the target the iPad is zoomed to. Pencil coordinates already arrive mapped into it;
             // the Mac only draws it for a moment.
@@ -450,6 +490,19 @@ final class SocketServer {
         default:
             log.debug("client \(c.id): unknown message \(t, privacy: .public)")
         }
+    }
+
+    /// The fresh frame is in (or the wait ran out): the touch that waited, and what came behind it, go through in order.
+    private func releaseHeld(_ c: Client) {
+        guard let held = c.held else { return }
+        c.held = nil
+        pencilActive = true
+        for data in held where !c.ended { handle(c, data) }
+    }
+
+    private func replyTarget(_ c: Client) {
+        guard !c.ended else { return }
+        send(c, ["t": "target", "target": targets.current.json])
     }
 
     private func authenticate(_ c: Client) {
