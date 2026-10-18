@@ -3,7 +3,7 @@ import os
 
 let log = Logger(subsystem: "com.dhrlabs.pencilpad", category: "app")
 
-/// Token and chosen screen live in the com.dhrlabs.pencilpad defaults domain,
+/// Token, chosen screen and the Open at Login flag live in the com.dhrlabs.pencilpad defaults domain,
 /// whether the app runs bundled (that is its own domain) or as a raw binary.
 @MainActor
 enum Settings {
@@ -27,6 +27,13 @@ enum Settings {
     static var targetScreenID: String? {
         get { defaults.string(forKey: "targetScreen") }
         set { defaults.set(newValue, forKey: "targetScreen") }
+    }
+
+    /// Set once the Open at Login default has been applied (or the menu item has been used). After that the app never
+    /// registers by itself again, so removing PencilPad from Login Items in System Settings stays removed.
+    static var loginItemDecided: Bool {
+        get { defaults.bool(forKey: "loginItemDecided") }
+        set { defaults.set(newValue, forKey: "loginItemDecided") }
     }
 }
 

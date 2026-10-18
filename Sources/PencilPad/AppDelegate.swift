@@ -1,5 +1,6 @@
 import AppKit
 import ApplicationServices
+import ServiceManagement
 import SystemConfiguration
 
 @MainActor
@@ -17,6 +18,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if !canPost {
             log.notice("launch: requesting post access; request returned \(CGRequestPostEventAccess())")
         }
+        openAtLoginByDefault()
 
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         item.button?.image = NSImage(systemSymbolName: "pencil.tip.crop.circle", accessibilityDescription: "PencilPad")
@@ -74,6 +76,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         } else {
             menu.addItem(action("Accessibility: not allowed. Open Settings…", #selector(openAccessibility)))
         }
+        menu.addItem(loginMenuItem())
         menu.addItem(.separator())
         menu.addItem(action("Show Board", #selector(showBoard)))
         menu.addItem(NSMenuItem(title: "Quit PencilPad", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
@@ -115,5 +118,81 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func showBoard() {
         socket.showBoard()
+    }
+
+    // MARK: Open at Login
+
+    /// Only the copy in /Applications is ever a login item. A build folder, a worktree or a raw binary never is, so a
+    /// development copy cannot end up starting at login (or taking the saved permissions' place).
+    private var runsFromApplications: Bool {
+        Bundle.main.bundleIdentifier == "com.dhrlabs.pencilpad"
+            && Bundle.main.bundleURL.deletingLastPathComponent().path == "/Applications"
+    }
+
+    private static func name(_ status: SMAppService.Status) -> String {
+        switch status {
+        case .enabled: "enabled"
+        case .notRegistered: "not registered"
+        case .requiresApproval: "waiting for approval in System Settings"
+        case .notFound: "not found"
+        @unknown default: "unknown"
+        }
+    }
+
+    /// The first launch from /Applications opens at login by default, once. After that only the menu item changes it.
+    private func openAtLoginByDefault() {
+        let service = SMAppService.mainApp
+        guard runsFromApplications else {
+            log.notice("login item: not registering; running from \(Bundle.main.bundleURL.path, privacy: .public) (status: \(Self.name(service.status), privacy: .public))")
+            return
+        }
+        guard !Settings.loginItemDecided else {
+            log.notice("login item: already decided; only the menu changes it (status: \(Self.name(service.status), privacy: .public))")
+            return
+        }
+        guard service.status == .notRegistered || service.status == .notFound else {
+            Settings.loginItemDecided = true  // already on, or waiting for approval: nothing for the app to do, ever
+            log.notice("login item: already set up (status: \(Self.name(service.status), privacy: .public))")
+            return
+        }
+        do {
+            try service.register()
+            Settings.loginItemDecided = true
+            log.notice("login item: registered by default, once (status: \(Self.name(service.status), privacy: .public))")
+        } catch {
+            log.error("login item: could not register: \(error.localizedDescription, privacy: .public)")
+        }
+    }
+
+    /// The real status, not a remembered one: checked when enabled, and a note when macOS wants approval.
+    private func loginMenuItem() -> NSMenuItem {
+        let status = SMAppService.mainApp.status
+        guard runsFromApplications else {
+            let item = disabled("Open at Login (only from Applications)")
+            item.state = status == .enabled ? .on : .off
+            return item
+        }
+        let item = action(status == .requiresApproval ? "Open at Login (approve in System Settings)" : "Open at Login", #selector(toggleLoginItem))
+        item.state = status == .enabled ? .on : .off
+        return item
+    }
+
+    @objc private func toggleLoginItem() {
+        let service = SMAppService.mainApp
+        do {
+            switch service.status {
+            case .enabled:
+                try service.unregister()
+                log.notice("login item: turned off in the menu")
+            case .requiresApproval:
+                SMAppService.openSystemSettingsLoginItems()
+            default:
+                try service.register()
+                log.notice("login item: turned on in the menu (status: \(Self.name(service.status), privacy: .public))")
+            }
+            Settings.loginItemDecided = true  // from here on the menu is the only thing that changes it
+        } catch {
+            log.error("login item: \(error.localizedDescription, privacy: .public)")
+        }
     }
 }
