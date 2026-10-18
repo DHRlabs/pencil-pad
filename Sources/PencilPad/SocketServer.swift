@@ -338,6 +338,11 @@ final class SocketServer {
             guard let value = (msg[key] as? NSNumber)?.doubleValue, value.isFinite else { return nil }
             return value
         }
+        // A window target follows its window, so its frame is re-read before this message is mapped into it.
+        if t == "hover" || t == "down", targets.followWindow(force: t == "down") {
+            send(c, ["t": "target", "target": targets.current.json])  // resized, or gone and now a screen
+            if targets.current.id != "window" { return }  // this message was aimed at the vanished window
+        }
         let x = num("x"), y = num("y")
         let at = x.flatMap { x in y.map { y in targets.current.point(x: x, y: y) } }
         let pressure = num("p") ?? 0
@@ -356,8 +361,19 @@ final class SocketServer {
         case "up":
             if let at { pen.up(at) } else { pen.release(reason: "up without coordinates") }
         case "target":
-            if let id = msg["id"] as? String { targets.select(id) }
+            _ = targets.followWindow(force: true)  // the reply carries the window as it is now
+            if let id = msg["id"] as? String {
+                if id == "window", msg["pick"] != nil {
+                    // A pick that is not a whole number cannot name a listed window: nothing changes.
+                    if let n = num("pick").flatMap({ Int(exactly: $0) }) { targets.pick(window: n) }
+                    else { log.error("client \(c.id): window pick is not a whole number") }
+                } else {
+                    targets.select(id)
+                }
+            }
             send(c, ["t": "target", "target": targets.current.json])  // reply even when unchanged, so the page stays in sync
+        case "windows":
+            send(c, ["t": "windows", "list": targets.windowList()])
         case "key":
             if let name = msg["name"] as? String { pen.key(name) }
         case "ping":

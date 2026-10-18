@@ -22,6 +22,9 @@ const STYLE_NAMES = { neon: 'Neon', aurora: 'Aurora', ember: 'Ember', off: 'Off'
 const AIM_AT = { off: 0, soft: 0.12, firm: 0.25 };
 const AIM_MODES = ['off', 'soft', 'firm'];
 const AIM_NAMES = { off: 'Off', soft: 'Soft', firm: 'Firm' };
+// A touch wider than this (CSS px across) on the toolbar or the window list is a resting palm, not a fingertip, and does nothing.
+// A guess for a fingertip on iPad glass: it may need tuning on the real iPad.
+const PALM_PX = 30;
 const HOVER_CONFIRM_MS = 100;   // hardware hover counts once 3+ pen hover moves span this long with no touch between
 
 // Visual event queue shared with fx.js: a ring of fixed-size records, no allocation per event.
@@ -34,7 +37,7 @@ const body = document.body;
 const surface = $('surface'), bar = $('bar'), frame = $('area'), areaLabel = $('area-label');
 const targetsEl = $('targets'), statusText = $('status-text'), rclickBtn = $('rclick');
 const styleBtn = $('style'), styleName = $('style-name'), fsBtn = $('fs'), insetsEl = $('insets');
-const aimBtn = $('aim'), aimName = $('aim-name');
+const aimBtn = $('aim'), aimName = $('aim-name'), winMenu = $('winmenu');
 
 const token = location.pathname.split('/').filter(Boolean)[0] || '';
 const wsURL = `ws://${location.hostname}:${WS_PORT}/`;
@@ -108,6 +111,7 @@ function fit() {
   s.left = area.x + 'px'; s.top = area.y + 'px'; s.width = w + 'px'; s.height = h + 'px';
   areaLabel.textContent = mode === 'board' ? 'Board · 16:9' : targetLabel();
   placeInk();
+  placeWinMenu();
 }
 
 function cachedAspect() {
@@ -347,6 +351,9 @@ function onMessage(data) {
     case 'target':
       setTarget(m.target);
       break;
+    case 'windows':
+      showWindows(m.list);
+      break;
     case 'denied':
       halt('denied', 'Wrong link');
       break;
@@ -365,8 +372,11 @@ function shortName(s) {
   return /built-?in|color lcd/i.test(s.name || '') ? 'Laptop' : (s.name || 'Screen');
 }
 
+let winChip = null;   // the Window chip, rebuilt with the others
+
 function renderTargets() {
   targetsEl.textContent = '';
+  winChip = null;
   const seen = {};
   const add = (label, id, title) => {
     const n = (seen[label] = (seen[label] || 0) + 1);
@@ -375,6 +385,13 @@ function renderTargets() {
     const span = document.createElement('span');
     span.textContent = n > 1 ? `${label} ${n}` : label;
     b.append(span);
+    if (id === 'window') {
+      winChip = b;
+      b.setAttribute('aria-haspopup', 'menu');
+      const caret = document.createElement('i');
+      caret.className = 'caret';
+      b.append(caret);
+    }
     targetsEl.append(b);
   };
   for (const s of screens) add(shortName(s), s.id, `${s.name} · ${s.w}×${s.h}`);
@@ -392,6 +409,14 @@ function markTarget() {
   for (const b of targetsEl.children) {
     b.classList.toggle('active', b.dataset.id === id);
     b.classList.remove('pending');
+  }
+  if (id !== 'window') closeWinMenu();
+  if (winChip) {
+    // A window target shows its app on the chip; a second tap on it chooses another window.
+    winChip.firstChild.textContent = id === 'window' && target.app ? target.app : 'Window';
+    winChip.title = id === 'window' ? `${target.name}. Tap to choose another window` : "The Mac's front window";
+    if (id === 'window') winChip.setAttribute('aria-expanded', String(!winMenu.hidden));
+    else winChip.removeAttribute('aria-expanded');
   }
 }
 
@@ -413,18 +438,102 @@ function setTarget(t) {
 targetsEl.addEventListener('click', (e) => {
   const b = e.target.closest('.chip');
   if (!b || !ready) return;
+  if (b === winChip && activeTargetId() === 'window') { toggleWinMenu(); return; }   // second tap: which window?
+  closeWinMenu();
   send(`{"t":"target","id":${JSON.stringify(b.dataset.id)}}`);
   if (!b.classList.contains('active')) b.classList.add('pending');
 });
 
+// ---------- Window picker ----------
+
+// Tapping Window while a window is already the target asks the Mac for its windows and lists them under the
+// chip, front first, the current one checked. A row asks the Mac to bring that window forward and target it.
+function toggleWinMenu() {
+  if (!winMenu.hidden) { closeWinMenu(); return; }
+  winMenu.hidden = false;
+  winNote('Loading windows…');
+  winChip.setAttribute('aria-expanded', 'true');
+  placeWinMenu();
+  send('{"t":"windows"}');
+}
+
+function closeWinMenu() {
+  if (winMenu.hidden) return;
+  winMenu.hidden = true;
+  winMenu.textContent = '';
+  if (winChip) winChip.setAttribute('aria-expanded', 'false');
+}
+
+function winNote(text) {
+  winMenu.textContent = '';
+  const n = document.createElement('div');
+  n.className = 'note'; n.textContent = text;
+  winMenu.append(n);
+}
+
+function showWindows(list) {
+  if (winMenu.hidden) return;   // closed before the Mac answered
+  if (!Array.isArray(list) || !list.length) { winNote('No windows'); placeWinMenu(); return; }
+  winMenu.textContent = '';
+  const text = (w) => (w.title ? `${w.app}: ${w.title}` : w.app);   // window titles are the Mac's data: text only
+  const seen = {};
+  for (const w of list) seen[text(w)] = (seen[text(w)] || 0) + 1;
+  for (const w of list) {
+    const b = document.createElement('button');
+    b.type = 'button'; b.className = 'row'; b.dataset.id = w.id;
+    b.setAttribute('role', 'menuitemradio');
+    b.setAttribute('aria-checked', String(w.current === true));
+    const tick = document.createElement('i'); tick.className = 'tick';
+    const label = document.createElement('span');
+    label.textContent = seen[text(w)] > 1 ? `${text(w)} (${w.w}×${w.h})` : text(w);   // two alike: the size tells them apart
+    b.append(tick, label);
+    winMenu.append(b);
+  }
+  placeWinMenu();
+}
+
+// Under the toolbar, left edge on the chip, kept on screen; scrolls when the list is longer than the room.
+function placeWinMenu() {
+  if (winMenu.hidden || !winChip) return;
+  const top = Math.round(bar.getBoundingClientRect().bottom + 8);
+  winMenu.style.top = top + 'px';
+  winMenu.style.maxHeight = Math.max(88, innerHeight - top - 14) + 'px';
+  winMenu.style.left = Math.round(Math.max(10, Math.min(winChip.getBoundingClientRect().left, innerWidth - winMenu.offsetWidth - 10))) + 'px';
+}
+
+winMenu.addEventListener('click', (e) => {
+  const b = e.target.closest('.row');
+  if (!b || !ready) return;
+  send(`{"t":"target","id":"window","pick":${Number(b.dataset.id)}}`);
+  if (winChip) winChip.classList.add('pending');   // until the Mac answers with the target
+  closeWinMenu();
+});
+
+// An outside tap closes the list. A Pencil down on the drawing surface that only dismisses it is swallowed,
+// so closing the list never clicks on the Mac.
+document.addEventListener('pointerdown', (e) => {
+  if (winMenu.hidden || winMenu.contains(e.target) || (winChip && winChip.contains(e.target))) return;
+  closeWinMenu();
+  if (e.target === surface) { e.stopPropagation(); e.preventDefault(); }
+}, true);
+
 // ---------- Buttons ----------
 
 // A toolbar press that starts while the Pencil is down is a palm or a slip: swallow it before any button sees it.
+// The same guard covers a palm-sized contact or a second finger: Touch radii are half the contact's size.
 let pressDuringStroke = false;
-bar.addEventListener('pointerdown', () => { pressDuringStroke = penId !== -1; }, true);
-bar.addEventListener('click', (e) => {
-  if (penId !== -1 || pressDuringStroke) { e.stopPropagation(); e.preventDefault(); }
-}, true);
+const palmSized = (e) => e.pointerType === 'touch' && Math.max(e.width, e.height) > PALM_PX;
+const palmTouch = (e) => e.touches.length > 1 || [...e.changedTouches].some((t) => 2 * Math.max(t.radiusX || 0, t.radiusY || 0) > PALM_PX);
+for (const el of [bar, winMenu]) {
+  el.addEventListener('pointerdown', (e) => {
+    if (e.isPrimary) pressDuringStroke = false;   // a later finger of the same press keeps what the first one decided
+    if (penId !== -1 || palmSized(e)) pressDuringStroke = true;
+  }, true);
+  el.addEventListener('touchstart', (e) => { if (palmTouch(e)) pressDuringStroke = true; }, { capture: true, passive: true });
+  el.addEventListener('click', (e) => {
+    if (penId !== -1 || pressDuringStroke) { e.stopPropagation(); e.preventDefault(); }
+  }, true);
+}
 
 for (const b of bar.querySelectorAll('[data-key]')) {
   b.addEventListener('click', () => { if (ready) send(`{"t":"key","name":"${b.dataset.key}"}`); });
@@ -491,6 +600,7 @@ document.addEventListener('fullscreenchange', onFS);
 document.addEventListener('webkitfullscreenchange', onFS);
 
 $('tuck').addEventListener('click', () => {
+  closeWinMenu();
   const t = bar.classList.toggle('tucked');
   $('tuck').title = t ? 'Show toolbar' : 'Hide toolbar';
   store.set('tucked', t ? '1' : '');
@@ -702,6 +812,7 @@ function sendExport(what) {
 
 // The socket is gone: what the Mac window is doing now is unknown until the next hello brings a state.
 function macLost() {
+  closeWinMenu();   // its windows are the old connection's
   stateOnConn = false; replayAnswered = false; boardOpen = null;
   syncClosed();
   if (pendingExport) { clearTimeout(pendingExport.timer); pendingExport = null; }
@@ -818,6 +929,7 @@ function setMode(m) {
   m = m === 'board' && core ? 'board' : 'mouse';
   if (m === mode) return;
   mode = m;
+  closeWinMenu();
   store.set('mode', mode);
   if (mode === 'board') {
     setRight(false);   // a right-click armed for the mouse must not wait behind the board
