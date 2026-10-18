@@ -1,4 +1,5 @@
 import AppKit
+import CryptoKit
 import Foundation
 import Network
 
@@ -14,6 +15,9 @@ final class Client {
     var boardReplayed = -1
     /// Input messages waiting, in order, for a fresh window frame before the first touch after a quiet spell (nil: none waiting).
     var held: [Data]?
+    /// What this connection must prove it can sign: 32 random bytes, sent in a `challenge` as soon as the socket opens.
+    let nonce = Data((0..<32).map { _ in UInt8.random(in: .min ... .max) })
+    var challenged = false
 
     init(id: Int, conn: NWConnection) {
         self.id = id
@@ -25,6 +29,7 @@ final class Client {
 @MainActor
 final class SocketServer {
     nonisolated static let port: NWEndpoint.Port = NWEndpoint.Port(rawValue: HTTPServer.port.rawValue + 1)!
+    nonisolated static let serviceType = "_pencilpad._tcp"
     /// Silence that releases a held button.
     static let silenceLimit: TimeInterval = 2
     /// Time allowed to send a valid hello, and silence that closes a logged-in client.
@@ -82,12 +87,25 @@ final class SocketServer {
     func start() {
         let params = NWParameters.tcp
         params.allowLocalEndpointReuse = true
+        // Apple's direct link (AWDL) too, so a native iPad app reaches this socket with no shared Wi-Fi network.
+        params.includePeerToPeer = true
         let ws = NWProtocolWebSocket.Options()
         ws.autoReplyPing = true
         ws.maximumMessageSize = 64 * 1024
         params.defaultProtocolStack.applicationProtocols.insert(ws, at: 0)
         do {
             let listener = try NWListener(using: params, on: Self.port)
+            // Bonjour: the native iPad app finds this Mac by service type. No name means the Mac's computer name;
+            // PENCILPAD_SERVICE_NAME overrides it so a test copy cannot be mistaken for the real one.
+            let serviceName = ProcessInfo.processInfo.environment["PENCILPAD_SERVICE_NAME"].flatMap { $0.isEmpty ? nil : $0 }
+            listener.service = NWListener.Service(name: serviceName, type: Self.serviceType)
+            listener.serviceRegistrationUpdateHandler = { change in
+                switch change {
+                case .add(let endpoint): log.notice("bonjour: advertising \(String(describing: endpoint), privacy: .public)")
+                case .remove(let endpoint): log.notice("bonjour: withdrew \(String(describing: endpoint), privacy: .public)")
+                @unknown default: break
+                }
+            }
             listener.stateUpdateHandler = { state in
                 switch state {
                 case .ready: log.notice("socket listening on port \(Self.port.rawValue)")
@@ -270,7 +288,9 @@ final class SocketServer {
         log.notice("client \(c.id) connected from \(String(describing: conn.endpoint), privacy: .public)")
         conn.stateUpdateHandler = { [weak self] state in
             MainActor.assumeIsolated {
+                log.debug("client \(c.id) connection state: \(String(describing: state), privacy: .public)")
                 switch state {
+                case .ready: self?.sendChallenge(c)
                 case .failed(let error): self?.end(c, reason: "failed: \(error)", closeFrame: false)
                 case .cancelled: self?.end(c, reason: "cancelled", closeFrame: false)
                 default: break
@@ -372,10 +392,21 @@ final class SocketServer {
         }
 
         guard c.authed else {
-            if t == "hello", let token = msg["token"] as? String, token == Settings.token {
-                authenticate(c)
+            guard t == "hello" else {
+                deny(c, why: "first frame was not hello")
+                return
+            }
+            if let proof = msg["proof"] as? String {
+                // The native app never sends the token: it signs the nonce with it.
+                if Self.proofIsValid(proof, nonce: c.nonce, challenged: c.challenged) {
+                    authenticate(c)
+                } else {
+                    deny(c, why: c.challenged ? "wrong proof" : "proof without a challenge")
+                }
+            } else if let token = msg["token"] as? String, Self.tokenIsValid(token) {
+                authenticate(c)  // the web page cannot sign over http, so it still sends the token
             } else {
-                deny(c, why: t == "hello" ? "wrong token" : "first frame was not hello")
+                deny(c, why: "wrong token")
             }
             return
         }
@@ -503,6 +534,25 @@ final class SocketServer {
     private func replyTarget(_ c: Client) {
         guard !c.ended else { return }
         send(c, ["t": "target", "target": targets.current.json])
+    }
+
+    private func sendChallenge(_ c: Client) {
+        guard !c.ended, !c.challenged else { return }
+        c.challenged = true
+        send(c, ["t": "challenge", "nonce": c.nonce.base64EncodedString()])
+    }
+
+    /// HMAC-SHA256 with the token's UTF-8 bytes as the key and the nonce as the message; compared in constant time.
+    private static func proofIsValid(_ proof: String, nonce: Data, challenged: Bool) -> Bool {
+        guard challenged, let given = Data(base64Encoded: proof) else { return false }
+        return HMAC<SHA256>.isValidAuthenticationCode(given, authenticating: nonce, using: SymmetricKey(data: Data(Settings.token.utf8)))
+    }
+
+    /// The raw token from the page, also compared in constant time (both sides are signed with a throwaway key first).
+    private static func tokenIsValid(_ given: String) -> Bool {
+        let key = SymmetricKey(size: .bits256)
+        let expected = HMAC<SHA256>.authenticationCode(for: Data(Settings.token.utf8), using: key)
+        return HMAC<SHA256>.isValidAuthenticationCode(expected, authenticating: Data(given.utf8), using: key)
     }
 
     private func authenticate(_ c: Client) {

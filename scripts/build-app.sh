@@ -49,6 +49,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>LSMinimumSystemVersion</key><string>15.0</string>
   <key>LSUIElement</key><true/>
   <key>NSLocalNetworkUsageDescription</key><string>PencilPad serves its drawing page to your iPad and receives Apple Pencil input over your local network.</string>
+  <key>NSBonjourServices</key><array><string>_pencilpad._tcp</string></array>
 </dict>
 </plist>
 PLIST
