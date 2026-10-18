@@ -13,6 +13,7 @@
 'use strict';
 
 const BGS = ['dark', 'white', 'grid', 'dots'];
+const IMG_ID = /^[0-9a-f]{12}$/;   // a pasted image's id: the name of its file on the Mac
 const H_OVER_W = 9 / 16;    // the board is 16:9; y is normalized to the board height
 const PTS_CHUNK = 512;      // most points in one begin/pts op from toOps() (about 13 KB on the wire)
 const TAU = Math.PI * 2;
@@ -32,41 +33,88 @@ function sanitizePts(pts) {
   return out;
 }
 
+// ---------- Images ----------
+
+// A board keeps its decoded pasted images by id (see createBoard). The URL is relative on purpose: it
+// resolves to /<token>/img/<id> on the iPad page and to pencilpad-board://board/img/<id> in the Mac
+// window, and both serve the Mac's image store. An entry settles once: a failed load stays failed,
+// so a missing file can never loop.
+function loadImage(cache, k) {   // cache: id -> { el, state: 'loading' | 'ready' | 'failed', done: Promise }
+  let e = cache.get(k);
+  if (e) return e;
+  const el = new Image();
+  e = { el, state: 'loading', done: null };
+  e.done = new Promise((resolve) => {
+    const settle = (state) => { e.state = state; resolve(); };
+    el.onload = () => (el.decode ? el.decode() : Promise.resolve()).catch(() => {}).then(() => settle('ready'));
+    el.onerror = () => settle('failed');
+  });
+  cache.set(k, e);
+  el.src = 'img/' + k;
+  return e;
+}
+
+// Every image that has decoded, under everything else.
+function drawImages(ctx, w, h, board) {
+  ctx.save();
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = 'high';
+  for (const it of board.items) {
+    if (it.kind !== 'image') continue;
+    const e = board.image(it.img);
+    if (e && e.state === 'ready') ctx.drawImage(e.el, it.x * w, it.y * h, it.w * w, it.h * h);
+  }
+  ctx.restore();
+}
+
 // ---------- Model ----------
 
 function createBoard() {
-  const strokes = [];          // live strokes in draw order
+  const items = [];            // everything on the board in order: strokes and images
   const byId = new Map();
+  const images = new Map();    // decoded pasted images by id (see loadImage)
   const undoStack = [], redoStack = [];
   let bg = 'dark', idSeq = 0;  // ids only ever grow, so an undone id is never reused
   let gen = 0;                 // bumps whenever anything already drawn changes (see createView)
 
-  const addStroke = (s) => { strokes.push(s); byId.set(s.id, s); };
+  const addItem = (s) => { items.push(s); byId.set(s.id, s); };
 
   // Remove by id, remembering the original positions so undo can put them back.
   const removeIds = (ids) => {
-    const set = new Set(ids), items = [];
-    strokes.forEach((s, i) => { if (set.has(s.id)) items.push({ s, i }); });
-    for (let k = items.length - 1; k >= 0; k--) { strokes.splice(items[k].i, 1); byId.delete(items[k].s.id); }
-    return items;
+    const set = new Set(ids), gone = [];
+    items.forEach((s, i) => { if (set.has(s.id)) gone.push({ s, i }); });
+    for (let k = gone.length - 1; k >= 0; k--) { items.splice(gone[k].i, 1); byId.delete(gone[k].s.id); }
+    return gone;
   };
-  const insertItems = (items) => {
-    for (const { s, i } of items) {
+  const insertItems = (gone) => {
+    for (const { s, i } of gone) {
       if (byId.has(s.id)) continue;
-      strokes.splice(Math.min(i, strokes.length), 0, s);
+      items.splice(Math.min(i, items.length), 0, s);
       byId.set(s.id, s);
     }
   };
   const pushStep = (step) => { undoStack.push(step); redoStack.length = 0; };
 
+  // Let go of decoded images that are neither on the board nor in its undo or redo history, so a long
+  // session does not hold dozens of decoded 4K pictures. Runs on reset and clear. (The picture stays on
+  // the Mac; a dropped one that comes back is simply loaded again.)
+  const pruneImages = () => {
+    const keep = new Set();
+    const note = (s) => { if (s.kind === 'image') keep.add(s.img); };
+    items.forEach(note);
+    for (const st of undoStack) { if (st.k === 'add') note(st.s); else st.items.forEach((it) => note(it.s)); }
+    for (const st of redoStack) { if (st.k === 'add') note(st.s); else st.items.forEach((it) => note(it.s)); }
+    for (const k of [...images.keys()]) if (!keep.has(k)) images.delete(k);
+  };
+
   const stepDo = (st) => {
-    if (st.k === 'add') { if (!byId.has(st.s.id)) addStroke(st.s); }
+    if (st.k === 'add') { if (!byId.has(st.s.id)) addItem(st.s); }
     else removeIds(st.items.map((it) => it.s.id));
   };
   const stepUndo = (st) => {
     if (st.k === 'add') {
       const s = byId.get(st.s.id);
-      if (s) { strokes.splice(strokes.indexOf(s), 1); byId.delete(s.id); }
+      if (s) { items.splice(items.indexOf(s), 1); byId.delete(s.id); }
     } else insertItems(st.items);
   };
 
@@ -75,8 +123,9 @@ function createBoard() {
     if (!m || typeof m !== 'object') return;
     switch (m.op) {
       case 'reset':
-        strokes.length = 0; byId.clear(); bg = 'dark'; idSeq = 0;
+        items.length = 0; byId.clear(); bg = 'dark'; idSeq = 0;
         undoStack.length = 0; redoStack.length = 0; gen++;
+        if (!m.keepImages) pruneImages();   // (rebase keeps them: it puts the same ones straight back, then prunes)
         break;
       case 'bg':
         if (BGS.includes(m.bg) && m.bg !== bg) { bg = m.bg; gen++; }
@@ -84,27 +133,43 @@ function createBoard() {
       case 'begin': {
         const pts = sanitizePts(m.pts);
         const s = byId.get(m.id);
-        if (s) {   // a repeated begin just continues the stroke
+        if (s) {   // a repeated begin just continues the stroke (an id that is not a stroke is left alone)
+          if (s.kind !== 'stroke') break;
           s.pts.push(...pts);
           if (s.ended) gen++;
           break;
         }
         const n = {
-          id: m.id,
+          kind: 'stroke', id: m.id,
           tool: m.tool === 'marker' ? 'marker' : 'pen',
           color: typeof m.color === 'string' && /^#[0-9a-f]{6}$/i.test(m.color) ? m.color.toLowerCase() : '#ffffff',
           size: Math.min(0.05, Math.max(0.0005, num(m.size, 0.0048))),
           pts, ended: false,
         };
-        addStroke(n);
+        addItem(n);
         if (Number.isFinite(n.id) && n.id >= idSeq) idSeq = n.id + 1;
         pushStep({ k: 'add', s: n });   // the whole stroke is one undo step
+        break;
+      }
+      case 'image': {   // a pasted picture, placed by its top-left corner; one undo step
+        if (!Number.isFinite(m.id) || byId.has(m.id) || typeof m.img !== 'string' || !IMG_ID.test(m.img)) break;
+        const n = {
+          kind: 'image', id: m.id, img: m.img,
+          x: r5(clamp01(num(m.x, 0))), y: r5(clamp01(num(m.y, 0))),
+          w: r5(Math.min(1, Math.max(0.001, num(m.w, 0.8)))), h: r5(Math.min(1, Math.max(0.001, num(m.h, 0.8)))),
+          ended: true,
+        };
+        addItem(n);
+        if (n.id >= idSeq) idSeq = n.id + 1;
+        pushStep({ k: 'add', s: n });
+        gen++;
+        loadImage(images, n.img).done.then(() => { gen++; if (board.onImage) board.onImage(); });
         break;
       }
       case 'pts': {   // points for a stroke that was never begun are ignored
         const s = byId.get(m.id);
         const pts = sanitizePts(m.pts);
-        if (s && pts.length) {
+        if (s && s.kind === 'stroke' && pts.length) {
           s.pts.push(...pts);
           if (s.ended) gen++;
         }
@@ -123,9 +188,10 @@ function createBoard() {
         break;
       }
       case 'clear': {
-        if (!strokes.length) break;
-        pushStep({ k: 'erase', items: strokes.map((s, i) => ({ s, i })) });
-        strokes.length = 0; byId.clear(); gen++;
+        if (!items.length) break;
+        pushStep({ k: 'erase', items: items.map((s, i) => ({ s, i })) });
+        items.length = 0; byId.clear(); gen++;
+        pruneImages();
         break;
       }
       case 'undo': {
@@ -143,11 +209,15 @@ function createBoard() {
     }
   }
 
-  // Ops that rebuild the current board: bg, then every live stroke. A stroke that is still open
+  // Ops that rebuild the current board: bg, then every live item. A stroke that is still open
   // (Pencil down) is replayed without its end so it can keep growing.
   function toOps() {
     const ops = [{ op: 'bg', bg }];
-    for (const s of strokes) {
+    for (const s of items) {
+      if (s.kind === 'image') {
+        ops.push({ op: 'image', id: s.id, img: s.img, x: s.x, y: s.y, w: s.w, h: s.h });
+        continue;
+      }
       const head = { op: 'begin', id: s.id, tool: s.tool, color: s.color, size: s.size };
       if (!s.pts.length) ops.push({ ...head, pts: [] });
       for (let i = 0; i < s.pts.length; i += PTS_CHUNK) {
@@ -159,28 +229,42 @@ function createBoard() {
     return ops;
   }
 
-  return {
+  const board = {
     get bg() { return bg; },
-    get strokes() { return strokes; },
+    get items() { return items; },
     get gen() { return gen; },
+    // Set by the page: called after a pasted image finishes loading, so it can redraw.
+    onImage: null,
+    // The cache entry for image `k` ({ el, state }), or undefined if it was never asked for or was dropped.
+    image: (k) => images.get(k),
     canUndo: () => undoStack.length > 0,
     canRedo: () => redoStack.length > 0,
     nextId: () => idSeq,
     apply,
     toOps,
+    // Resolves once every image on the board has loaded or failed to; a missing file never blocks it.
+    async imagesReady() {
+      for (;;) {
+        const waiting = items.filter((it) => it.kind === 'image').map((it) => loadImage(images, it.img)).filter((e) => e.state === 'loading');
+        if (!waiting.length) return;
+        await Promise.all(waiting.map((e) => e.done));
+      }
+    },
     // Collapse the history to exactly what a replay carries: reset, then toOps() applied back.
     // The page does this whenever it replays to the Mac, because the Mac only ever sees the replay;
     // doing it on both sides keeps undo and redo identical afterwards. Returns the ops.
     rebase() {
       const ops = toOps();
-      apply({ op: 'reset' });
+      apply({ op: 'reset', keepImages: true });   // no flicker: the pictures that stay are never reloaded
       for (const o of ops) apply(o);
+      pruneImages();
       return ops;
     },
     // Strokes whose path passes within r (a fraction of the board width) of x, y: the eraser.
     hitTest(x, y, r) {
       const ay = y * H_OVER_W, ids = [];
-      for (const s of strokes) {
+      for (const s of items) {
+        if (s.kind === 'image') continue;   // the eraser never takes a pasted image; undo and clear do
         const pts = s.pts;
         if (!pts.length) continue;
         const reach = r + s.size * (s.tool === 'marker' ? 2.2 : 1) / 2 + 0.001, lim2 = reach * reach;
@@ -199,6 +283,7 @@ function createBoard() {
       return ids;
     },
   };
+  return board;
 }
 
 // ---------- Drawing ----------
@@ -316,15 +401,22 @@ function drawBG(ctx, w, h, bg) {
   ctx.restore();
 }
 
-// The whole board from scratch: background, then every live stroke in order.
-function render(board, ctx, w, h) {
-  drawBG(ctx, w, h, board.bg);
-  for (const s of board.strokes) drawStroke(ctx, w, h, s, board.bg);
+// One item above the images. (Images are drawn first, all together, by drawImages.)
+function drawItem(ctx, w, h, it, bg) {
+  if (it.kind === 'stroke') drawStroke(ctx, w, h, it, bg);
 }
 
-// The same picture, cheaper, for a canvas that redraws as strokes arrive. Background and finished
-// strokes live in a cached layer that is rebuilt only when something already drawn changes (undo,
-// redo, erase, clear, background, reset, resize); the stroke being drawn goes on top each frame.
+// The whole board from scratch: background, then the images, then every live stroke in order.
+function render(board, ctx, w, h) {
+  drawBG(ctx, w, h, board.bg);
+  drawImages(ctx, w, h, board);
+  for (const s of board.items) drawItem(ctx, w, h, s, board.bg);
+}
+
+// The same picture, cheaper, for a canvas that redraws as strokes arrive. Background, images and
+// finished strokes live in a cached layer that is rebuilt only when something already drawn changes
+// (undo, redo, erase, clear, background, reset, resize, an image added or finished loading); the
+// stroke being drawn goes on top each frame.
 // The output is pixel-identical to render().
 function createView() {
   let base = null, bctx = null, bw = 0, bh = 0, gen = -1, bg = '', baked = 0;
@@ -334,12 +426,13 @@ function createView() {
       if (bw !== w || bh !== h) { base.width = bw = w; base.height = bh = h; gen = -1; }
       if (gen !== board.gen || bg !== board.bg) {
         drawBG(bctx, w, h, board.bg);
+        drawImages(bctx, w, h, board);
         gen = board.gen; bg = board.bg; baked = 0;
       }
-      const list = board.strokes;
-      while (baked < list.length && list[baked].ended) drawStroke(bctx, w, h, list[baked++], board.bg);
+      const list = board.items;
+      while (baked < list.length && list[baked].ended) drawItem(bctx, w, h, list[baked++], board.bg);
       ctx.drawImage(base, 0, 0);
-      for (let i = baked; i < list.length; i++) drawStroke(ctx, w, h, list[i], board.bg);
+      for (let i = baked; i < list.length; i++) drawItem(ctx, w, h, list[i], board.bg);
     },
   };
 }

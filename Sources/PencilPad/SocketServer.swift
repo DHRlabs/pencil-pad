@@ -154,8 +154,27 @@ final class SocketServer {
             exportBoard(c, what: "copy")
         case "save":
             exportBoard(c, what: "save")
+        case "paste":
+            pasteImage(c)
         default:
             log.debug("client \(c.id): unknown board op \(msg["op"] as? String ?? "", privacy: .public)")
+        }
+    }
+
+    /// Stores the image on the Mac clipboard and tells the iPad its id and size, or why there is none.
+    /// The page then places it with an `image` op; the file is served to both boards by id.
+    private func pasteImage(_ c: Client) {
+        let sources = BoardImages.clipboard()  // read here; decoding a big screenshot happens off the main actor
+        Task {
+            let result = await Task.detached { BoardImages.store(sources) }.value
+            switch result {
+            case .success(let image):
+                log.notice("board paste: stored \(image.k, privacy: .public) \(image.w)x\(image.h)")
+                send(c, ["t": "board", "op": "pasted", "ok": true, "img": image.k, "w": image.w, "h": image.h])
+            case .failure(let failure):
+                log.notice("board paste: \(failure.why, privacy: .public)")
+                send(c, ["t": "board", "op": "pasted", "ok": false, "why": failure.why])
+            }
         }
     }
 

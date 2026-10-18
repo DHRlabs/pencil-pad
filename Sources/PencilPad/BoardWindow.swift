@@ -248,6 +248,16 @@ private final class BoardPages: NSObject, WKURLSchemeHandler {
 
     func webView(_ webView: WKWebView, start urlSchemeTask: any WKURLSchemeTask) {
         let url = urlSchemeTask.request.url ?? Self.pageURL
+        // Pasted images (subresources of the page, not navigations) come from their own store by id.
+        if url.path.hasPrefix("/img/") {
+            if let data = BoardImages.data(String(url.path.dropFirst(5))) {
+                reply(urlSchemeTask, url: url, status: 200, type: "image/png", body: data, cache: BoardImages.cacheControl)
+            } else {
+                log.error("board: no such image \(url.path, privacy: .public)")
+                reply(urlSchemeTask, url: url, status: 404, type: "text/plain", body: Data())
+            }
+            return
+        }
         let file = root.appendingPathComponent(url.path).standardizedFileURL.resolvingSymlinksInPath()
         guard file.path.hasPrefix(root.path + "/"), let data = try? Data(contentsOf: file) else {
             log.error("board: no such page file \(url.path, privacy: .public)")
@@ -259,8 +269,8 @@ private final class BoardPages: NSObject, WKURLSchemeHandler {
 
     func webView(_ webView: WKWebView, stop urlSchemeTask: any WKURLSchemeTask) {}
 
-    private func reply(_ task: any WKURLSchemeTask, url: URL, status: Int, type: String, body: Data) {
-        let headers = ["Content-Type": type, "Content-Length": String(body.count), "Cache-Control": "no-store"]
+    private func reply(_ task: any WKURLSchemeTask, url: URL, status: Int, type: String, body: Data, cache: String = "no-store") {
+        let headers = ["Content-Type": type, "Content-Length": String(body.count), "Cache-Control": cache]
         let response = HTTPURLResponse(url: url, statusCode: status, httpVersion: "HTTP/1.1", headerFields: headers)!
         task.didReceive(response)
         task.didReceive(body)

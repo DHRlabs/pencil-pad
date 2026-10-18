@@ -647,6 +647,7 @@ let bColor = COLORS.includes(store.get('bcolor')) ? store.get('bcolor') : '#ffff
 let bSize = SIZES.some(([, v]) => v === Number(store.get('bsize'))) ? Number(store.get('bsize')) : 0.0048;
 
 const board = core ? createBoard() : null, view = core ? createView() : null;
+if (board) board.onImage = () => wake();   // a pasted image finished loading: draw it
 let bLive = null, bErasing = false;   // open stroke id, eraser drag
 let bPending = [], bErase = new Set();   // points and stroke ids waiting for this frame's flush
 
@@ -819,6 +820,25 @@ function macLost() {
   if (pendingSave) { clearTimeout(pendingSave); pendingSave = 0; toast('Connection lost during the save'); }
 }
 
+// Paste: the Mac stores the image on its clipboard and answers with its id and pixel size; the page
+// then places it on the board like any other op. A tap while the Pencil is down never gets here (the
+// palm rule on the toolbar swallows it).
+function pasteImage() {
+  if (!ready) { toast('Not connected to the Mac'); return; }
+  send('{"t":"board","op":"paste"}');
+}
+
+// Centered, as large as fits in 80% of the board, keeping the picture's shape. x, y, w, h are board
+// fractions (w of the width, h of the height), so the fit is worked in 16 by 9 board units.
+const PASTE_FIT = 0.8;
+function placeImage(m) {
+  const pw = Number(m.w), ph = Number(m.h);
+  if (typeof m.img !== 'string' || !(pw > 0) || !(ph > 0)) return;
+  const s = Math.min(PASTE_FIT * 16 / pw, PASTE_FIT * 9 / ph);
+  const w = pw * s / 16, h = ph * s / 9;
+  inkOp({ op: 'image', id: board.nextId(), img: m.img, x: r5((1 - w) / 2), y: r5((1 - h) / 2), w: r5(w), h: r5(h) });
+}
+
 // ---------- Pencil -> ink ----------
 
 const bPressure = (e) => (e.pressure > 0 ? Math.round(e.pressure * 1000) / 1000 : 0.5);   // no pressure: half
@@ -904,6 +924,8 @@ function onBoard(m) {
     stateOnConn = true;
     syncClosed();
     checkExport();
+  } else if (m.op === 'pasted') {
+    if (m.ok) placeImage(m); else toast(m.why || 'Nothing to paste');
   } else if (m.op === 'done') {
     if (m.what === 'save' && pendingSave) { clearTimeout(pendingSave); pendingSave = 0; }
     if (m.what === 'copy') toast(m.ok ? 'Copied to Mac clipboard' : 'Copy failed');
@@ -957,7 +979,7 @@ function bUI() {
   for (const b of sizeBtns) b.classList.toggle('active', +b.dataset.s === bSize);
   undoBtn.disabled = !board.canUndo();
   redoBtn.disabled = !board.canRedo();
-  body.classList.toggle('inked', board.strokes.length > 0);
+  body.classList.toggle('inked', board.items.length > 0);
 }
 
 bar.addEventListener('click', (e) => {   // the palm rule above already swallowed any press made while the Pencil is down
@@ -975,6 +997,7 @@ bar.addEventListener('click', (e) => {   // the palm rule above already swallowe
     case 'clear': inkOp({ op: 'clear' }); break;
     case 'bg': inkOp({ op: 'bg', bg: BGS[(BGS.indexOf(board.bg) + 1) % BGS.length] }); break;
     case 'copy': case 'save': exportBoard(b.dataset.b); break;
+    case 'paste': pasteImage(); break;
   }
 });
 
@@ -989,7 +1012,7 @@ try {
   const saved = board ? JSON.parse(store.get('board') || 'null') : null;
   if (Array.isArray(saved)) {
     for (const o of saved) board.apply(o);
-    for (const s of board.strokes) board.apply({ op: 'end', id: s.id });
+    for (const s of board.items) board.apply({ op: 'end', id: s.id });
   }
 } catch (_) { /* a damaged snapshot just starts an empty board */ }
 

@@ -94,6 +94,7 @@ final class HTTPServer {
         let parts = requestLine.split(separator: " ")
         // Only a GET under the token is answered; any other method, path, or unparsable request is 404.
         var (status, type, body) = (404, "text/plain; charset=utf-8", Data("Not found\n".utf8))
+        var cache = "no-cache"
         var location: String?
         let bare = "/\(Settings.token)"
         if parts.count >= 2, parts[0] == "GET" {
@@ -103,12 +104,13 @@ final class HTTPServer {
                 location = bare + "/" + parts[1].dropFirst(bare.count)
             } else if let file = lookup(String(parts[1])) {
                 (status, type, body) = (200, file.type, file.data)
+                cache = file.cache
             }
         }
         log.debug("http \(status)")
         let reason = [200: "OK", 301: "Moved Permanently", 404: "Not Found"][status] ?? ""
         var head = ["HTTP/1.1 \(status) \(reason)", "Content-Type: \(type)", "Content-Length: \(body.count)",
-                    "Cache-Control: no-cache", "Connection: close"]
+                    "Cache-Control: \(cache)", "Connection: close"]
         if let location { head.append("Location: \(location)") }
         var response = Data((head.joined(separator: "\r\n") + "\r\n\r\n").utf8)
         response.append(body)
@@ -117,7 +119,7 @@ final class HTTPServer {
         })
     }
 
-    private func lookup(_ target: String) -> (type: String, data: Data)? {
+    private func lookup(_ target: String) -> (type: String, data: Data, cache: String)? {
         guard let root else { return nil }
         let path = target.split(separator: "?", maxSplits: 1, omittingEmptySubsequences: false).first.map(String.init) ?? ""
         let prefix = "/\(Settings.token)/"
@@ -130,13 +132,18 @@ final class HTTPServer {
         guard !segments.contains(where: { $0.isEmpty || $0.hasPrefix(".") }),
               !relative.contains("\\"), !relative.contains("\0")
         else { return nil }
+        // Pasted board images come from their own store by id and never from the web root. The picture
+        // behind an id never changes, so the browser may keep it.
+        if relative.hasPrefix("img/") {
+            return BoardImages.data(String(relative.dropFirst(4))).map { ("image/png", $0, BoardImages.cacheControl) }
+        }
         let file = root.appendingPathComponent(relative).standardizedFileURL.resolvingSymlinksInPath()
         var isDir: ObjCBool = false
         guard file.path.hasPrefix(root.path + "/"),
               FileManager.default.fileExists(atPath: file.path, isDirectory: &isDir), !isDir.boolValue,
               let data = try? Data(contentsOf: file)
         else { return nil }
-        return (Self.contentType(file.pathExtension.lowercased()), data)
+        return (Self.contentType(file.pathExtension.lowercased()), data, "no-cache")
     }
 
     static func contentType(_ ext: String) -> String {

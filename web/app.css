@@ -370,11 +370,14 @@ body:not([data-mode="board"]) #board-tools { display: none; }
   body[data-mode="board"] #status-text,
   body[data-mode="board"] #modes span { display: none; }
 }
-@media (max-width: 900px) {
+/* The board tools tighten below about 1130px (they did below 900px before Paste joined them), so the one-row bar still fits at 1080. */
+@media (max-width: 1130px) {
   #board-tools .tool { min-width: 40px; padding: 0 4px; }
   #bar .sw { width: 30px; min-width: 30px; }
   #bar .sw i { width: 16px; height: 16px; }
   #bar .sz { min-width: 34px; }
+}
+@media (max-width: 900px) {
   #modes span { display: none; }
   #bar .seg button { min-width: 40px; padding: 0 5px; }
   #modes + .sep { display: none; }
