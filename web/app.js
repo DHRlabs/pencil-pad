@@ -5,7 +5,7 @@
 // board-core.js is a classic script loaded by index.html before this module (see its header). If it
 // failed to load, Board is switched off and Mouse mode runs exactly as before.
 const core = globalThis.PencilBoardCore || null;
-const { createBoard, createView, BGS } = core || {};
+const { createBoard, createView, drawItem, fitNote, BGS, SHAPES } = core || {};
 
 const WS_PORT = Number(location.port || 8710) + 1;   // the socket is always the page port + 1
 const PING_MS = 500;
@@ -41,6 +41,7 @@ const targetsEl = $('targets'), statusText = $('status-text'), rclickBtn = $('rc
 const styleBtn = $('style'), styleName = $('style-name'), fsBtn = $('fs'), insetsEl = $('insets');
 const aimBtn = $('aim'), aimName = $('aim-name'), winMenu = $('winmenu');
 const zoomBtn = $('zoom'), hudLevel = $('hud-level'), miniEl = $('minimap'), miniBox = miniEl.firstElementChild;
+const editorEl = $('editor'), edText = $('ed-text'), edBar = $('ed-bar');
 
 const token = location.pathname.split('/').filter(Boolean)[0] || '';
 const wsURL = `ws://${location.hostname}:${WS_PORT}/`;
@@ -136,6 +137,7 @@ function fit() {
   areaLabel.textContent = mode === 'board' ? 'Board · 16:9' : targetLabel();
   placeInk();
   placeWinMenu();
+  if (editing) { layoutEditor(); keepEditorVisible(); }   // rotation or a toolbar wrap moved the board: the editor follows it
   queueRegion();
 }
 
@@ -185,7 +187,8 @@ function flushAim() {
 }
 
 function onDown(e) {
-  if (e.pointerType !== 'pen' || penId !== -1 || zoomPtrs.size) return;   // fingers zooming: the Pencil does nothing to the Mac
+  // fingers zooming: the Pencil does nothing to the Mac; while text is being typed the Pencil does not draw
+  if (e.pointerType !== 'pen' || penId !== -1 || zoomPtrs.size || editing) return;
   const x = e.clientX, y = e.clientY;
   if (!inArea(x, y)) return;
   penId = e.pointerId; hoverStart = 0; hoverCount = 0;
@@ -243,7 +246,7 @@ function onMove(e) {
 
 function onUp(e) {
   if (e.pointerId !== penId) return;
-  if (mode === 'board') { boardUp(); return; }
+  if (mode === 'board') { boardUp(e); return; }
   if (e.type === 'pointerup' || e.type === 'pointermove') { lastX = toTargetX(normX(e.clientX)); lastY = toTargetY(normY(e.clientY)); }
   if (stroke) send(`{"t":"up","x":${lastX},"y":${lastY}}`);   // an aim-only touch sends nothing on lift
   stroke = false; penId = -1; aiming = false; aimPending = false; hoverStart = 0; hoverCount = 0;
@@ -283,14 +286,26 @@ surface.addEventListener('lostpointercapture', onUp);
 surface.addEventListener('pointerleave', onLeave);
 
 // Kill Safari's own gestures everywhere except on buttons.
-const notButton = (e) => !(e.target instanceof Element && e.target.closest('button'));
-const block = (e) => { if (notButton(e)) e.preventDefault(); };
+const notButton = (e) => !(e.target instanceof Element && e.target.closest('button, textarea'));
+// While text is being typed, a touch within SCRIBBLE_PX of the text box is let through too, so handwriting that
+// starts beside the box still reaches Scribble.
+const SCRIBBLE_PX = 40;
+const nearEditor = (e) => {
+  if (!editing) return false;
+  const r = edText.getBoundingClientRect();
+  return [...e.touches, ...e.changedTouches].some((t) =>
+    t.clientX >= r.left - SCRIBBLE_PX && t.clientX <= r.right + SCRIBBLE_PX && t.clientY >= r.top - SCRIBBLE_PX && t.clientY <= r.bottom + SCRIBBLE_PX);
+};
+const block = (e) => { if (notButton(e) && !nearEditor(e)) e.preventDefault(); };
 document.addEventListener('touchstart', block, { passive: false });
 document.addEventListener('touchmove', block, { passive: false });
 for (const t of ['gesturestart', 'gesturechange', 'gestureend']) document.addEventListener(t, (e) => e.preventDefault(), { passive: false });
 document.addEventListener('dblclick', (e) => e.preventDefault(), { passive: false });
 document.addEventListener('contextmenu', (e) => e.preventDefault());
-document.addEventListener('selectstart', (e) => e.preventDefault());
+document.addEventListener('selectstart', (e) => {   // no selecting anywhere except in the text editor
+  const t = e.target instanceof Element ? e.target : e.target && e.target.parentElement;
+  if (!(t && t.closest('textarea'))) e.preventDefault();
+});
 
 // Stuck-button safety.
 document.addEventListener('visibilitychange', () => {
@@ -709,7 +724,7 @@ let pressDuringStroke = false;
 const palmSized = (e) => e.pointerType === 'touch' && Math.max(e.width, e.height) > PALM_PX;
 const touchPalm = (t) => 2 * Math.max(t.radiusX || 0, t.radiusY || 0) > PALM_PX;
 const palmTouch = (e) => e.touches.length > 1 || [...e.changedTouches].some(touchPalm);
-for (const el of [bar, winMenu]) {
+for (const el of [bar, winMenu, edBar]) {
   el.addEventListener('pointerdown', (e) => {
     if (e.isPrimary) pressDuringStroke = false;   // a later finger of the same press keeps what the first one decided
     if (penId !== -1 || palmSized(e)) pressDuringStroke = true;
@@ -815,25 +830,41 @@ const SIZES = [['s', 0.0028], ['m', 0.0048], ['l', 0.0078]];   // pen width, fra
 const ERASE_R = 0.014;      // eraser reach, fraction of the board width
 const PTS_CAP = 1000;       // most points in one live pts frame (about 26 KB; the limit is 60 KB)
 const ERASE_CAP = 4000;     // most stroke ids in one erase frame
+const H_OVER_W = 9 / 16;    // the board is 16:9
+const MIN_SHAPE = 0.006;    // a shape drag shorter than this (board widths) is a tap, not a shape
+const SHAPE_NAMES = { line: 'Line', arrow: 'Arrow', rect: 'Rectangle', ellipse: 'Ellipse' };
+const SHAPE_ICONS = {
+  line: '<path d="M5 19 19 5"/>',
+  arrow: '<path d="M5 19 19 5"/><path d="M10 5h9v9"/>',
+  rect: '<rect x="4.5" y="6.5" width="15" height="11" rx="1.5"/>',
+  ellipse: '<ellipse cx="12" cy="12" rx="8" ry="6"/>',
+};
+const TEXT_SIZES = { 0.0028: 0.032, 0.0048: 0.048, 0.0078: 0.075 };   // pen size -> text size, a fraction of the board height
+const NOTE_H = 0.16, NOTE_W = Math.round(NOTE_H * H_OVER_W * 1e5) / 1e5;   // a sticky note is 0.16 of the board height each way
 
 const ink = $('ink'), inkCtx = ink.getContext('2d');
 const breopen = $('breopen'), toastEl = $('toast'), hintEl = $('hint');
 const hintTitle = hintEl.querySelector('strong'), hintText = hintEl.querySelector('span');
 const modeBtns = [...bar.querySelectorAll('[data-m]')];
-const toolBtns = [...bar.querySelectorAll('[data-b="pen"],[data-b="marker"],[data-b="eraser"]')];
+const toolBtns = [...bar.querySelectorAll('[data-b="pen"],[data-b="marker"],[data-b="eraser"],[data-b="shape"],[data-b="text"],[data-b="note"]')];
+const shapeBtn = bar.querySelector('[data-b="shape"]');
 const colorBtns = [...bar.querySelectorAll('[data-c]')], sizeBtns = [...bar.querySelectorAll('[data-s]')];
 const undoBtn = bar.querySelector('[data-b="undo"]'), redoBtn = bar.querySelector('[data-b="redo"]');
 
 let mode = core && store.get('mode') === 'board' ? 'board' : 'mouse';
 if (!core) body.classList.add('noboard');
 try { localStorage.removeItem('pencilpad.boardopen'); } catch (_) {}   // an earlier build remembered the window state; the Mac is the truth now
-let bTool = ['pen', 'marker', 'eraser'].includes(store.get('btool')) ? store.get('btool') : 'pen';
+let bTool = ['pen', 'marker', 'eraser', 'shape', 'text', 'note'].includes(store.get('btool')) ? store.get('btool') : 'pen';
+let bShape = core && SHAPES.includes(store.get('bshape')) ? store.get('bshape') : 'line';
 let bColor = COLORS.includes(store.get('bcolor')) ? store.get('bcolor') : '#ffffff';
 let bSize = SIZES.some(([, v]) => v === Number(store.get('bsize'))) ? Number(store.get('bsize')) : 0.0048;
 
 const board = core ? createBoard() : null, view = core ? createView() : null;
 if (board) board.onImage = () => wake();   // a pasted image finished loading: draw it
 let bLive = null, bErasing = false;   // open stroke id, eraser drag
+let shapeDrag = null;                 // a shape being dragged: its two corners (board fractions)
+let placing = null;                   // the Pencil is down with the Text or Note tool: where it touched
+let editing = null;                   // the text or note being typed: what it is and where it goes
 let bPending = [], bErase = new Set();   // points and stroke ids waiting for this frame's flush
 
 const lightBg = () => board.bg === 'white' || board.bg === 'grid';
@@ -873,6 +904,7 @@ function drawInk() {
   const w = ink.width, h = ink.height;
   if (!w || !h || mode !== 'board') return;
   view.draw(board, inkCtx, w, h);   // the board itself: identical to the Mac window
+  if (shapeDrag) drawItem(inkCtx, w, h, { kind: 'shape', shape: bShape, color: inkColor(), size: bSize, ...shapeDrag }, board.bg);   // the shape being dragged, drawn exactly as it will land
   // A subtle glow at the tip while inking, plus a few motes. Drawn over the board each frame, never into it.
   const k = w / area.w, light = lightBg();
   inkCtx.save();
@@ -1037,6 +1069,11 @@ function boardDown(e, x, y) {
   if (bTool === 'eraser') {
     bErasing = true; bErase.clear();
     eraseAt(x, y);
+  } else if (bTool === 'shape') {
+    const X = normX(x), Y = normY(y);
+    shapeDrag = { x0: X, y0: Y, x1: X, y1: Y };
+  } else if (bTool === 'text' || bTool === 'note') {
+    placing = { x: normX(x), y: normY(y), sx: x, sy: y, moved: false };   // placed when the Pencil lifts, if it was a tap
   } else {
     const id = board.nextId();
     bLive = id;
@@ -1051,6 +1088,8 @@ function boardMove(e) {
   for (const ev of events) {
     const x = ev.clientX, y = ev.clientY;
     if (bErasing) eraseAt(x, y);
+    else if (shapeDrag) { shapeDrag.x1 = normX(x); shapeDrag.y1 = normY(y); }
+    else if (placing) { if (Math.hypot(x - placing.sx, y - placing.sy) > 40) placing.moved = true; }
     else if (bLive !== null) {
       const X = normX(x), Y = normY(y), n = bPending.length;
       if (n ? bPending[n - 1][0] !== X || bPending[n - 1][1] !== Y : true) {
@@ -1063,16 +1102,27 @@ function boardMove(e) {
   wake(180);
 }
 
-function boardUp() {
+// The Pencil lifted. A tap with the Text or Note tool opens the editor where it touched.
+function boardUp(e) {
+  const tapped = placing && !placing.moved && e && (e.type === 'pointerup' || e.type === 'pointermove') ? placing : null;
   boardLift();
   penId = -1; hoverStart = 0; hoverCount = 0;   // the mouse path never runs in Board mode
+  if (tapped) openEditor(bTool, tapped.x, tapped.y);
 }
 
-// Finish any open stroke or eraser drag: send what is pending, end the stroke, forget it.
+// Finish any open stroke, shape or eraser drag: send what is pending, end the stroke, forget it.
 function boardLift() {
   bFlush();
   bErasing = false;
   if (bLive !== null) { inkOp({ op: 'end', id: bLive }); bLive = null; }
+  if (shapeDrag) {
+    const d = shapeDrag;
+    shapeDrag = null;
+    if (Math.hypot(d.x1 - d.x0, (d.y1 - d.y0) * H_OVER_W) >= MIN_SHAPE) {
+      inkOp({ op: 'shape', id: board.nextId(), kind: bShape, x0: d.x0, y0: d.y0, x1: d.x1, y1: d.y1, color: inkColor(), size: bSize });
+    }
+  }
+  placing = null;
   bPending = [];
   tip.on = false;
   wake(300);   // a last frame or two without the glow
@@ -1095,6 +1145,103 @@ function bFlush() {
     bPending = [];
     for (let i = 0; i < pts.length; i += PTS_CAP) inkOp({ op: 'pts', id: bLive, pts: pts.slice(i, i + PTS_CAP) });
   }
+}
+
+// ---------- Text and sticky note editor ----------
+
+// A real textarea laid over the board where the Pencil tapped, so iPad Scribble handwriting and the
+// keyboard both work. Done puts the text on the board as one op; empty text cancels. While it is open the
+// Pencil does not draw (onDown), and a tap on any toolbar button finishes it first.
+const noteColor = () => (bColor === '#ffffff' ? '#ffd60a' : bColor);   // a sticky note is yellow unless a color is picked
+const tintOf = (hex) => {   // the same soft tint the board draws a note in
+  const n = parseInt(hex.slice(1), 16), t = (v) => Math.round(v + (255 - v) * 0.7);
+  return `rgb(${t((n >> 16) & 255)},${t((n >> 8) & 255)},${t(n & 255)})`;
+};
+
+function openEditor(kind, X, Y) {
+  closeEditor(true);   // finish an earlier one first
+  if (kind === 'note') {
+    const w = NOTE_W, h = NOTE_H;   // centered on the tap, kept on the board
+    editing = { kind, x: r5(Math.min(1 - w, Math.max(0, X - w / 2))), y: r5(Math.min(1 - h, Math.max(0, Y - h / 2))), w, h, color: noteColor() };
+  } else {
+    editing = { kind, x: X, y: Y, size: TEXT_SIZES[bSize] || 0.048, color: inkColor() };
+  }
+  edText.value = '';
+  edText.maxLength = kind === 'note' ? 600 : 2000;
+  layoutEditor();
+  editorEl.hidden = false;
+  keepEditorVisible();
+  edText.focus();
+}
+
+function layoutEditor() {
+  if (!editing) return;
+  const e = editing, left = area.x + e.x * area.w, top = area.y + e.y * area.h, st = edText.style;
+  editorEl.style.left = left + 'px';
+  editorEl.style.top = top + 'px';
+  if (e.kind === 'note') {
+    const w = e.w * area.w, h = e.h * area.h, pad = Math.min(w, h) * 0.1, fs = h * 0.22;
+    st.width = w + 'px'; st.height = Math.max(h, 3 * fs * 1.2 + 2 * pad) + 'px'; st.padding = pad + 'px';   // never less than three lines
+    st.background = tintOf(e.color); st.color = '#2a2a2c';
+    st.fontSize = fs + 'px'; st.lineHeight = '1.2'; st.fontWeight = '500';
+    st.boxShadow = '0 0 0 2px rgb(var(--accent) / .85), 0 6px 18px rgb(0 0 0 / .4)'; st.borderRadius = Math.min(w, h) * 0.05 + 'px';
+  } else {
+    const fs = e.size * area.h;
+    st.width = Math.max(200, Math.min(area.w * 0.5, area.x + area.w - left)) + 'px';
+    st.padding = '0';
+    st.background = 'transparent'; st.color = e.color;
+    st.fontSize = fs + 'px'; st.lineHeight = '1.25'; st.fontWeight = '600';
+    st.boxShadow = '0 0 0 2px rgb(var(--accent) / .85), 0 0 18px rgb(var(--accent) / .3)'; st.borderRadius = '3px';
+    st.height = Math.max(3 * fs * 1.25, edText.scrollHeight) + 'px';   // never less than three lines
+  }
+}
+
+// The on-screen keyboard can cover the lower part of the page: lift the editor above it.
+function keepEditorVisible() {
+  if (!editing) return;
+  const vv = window.visualViewport, bottom = vv ? vv.offsetTop + vv.height : innerHeight;
+  const r = edText.getBoundingClientRect();
+  const up = r.bottom + 56 > bottom && r.top > 64;   // the Done row goes above the box when there is no room below it
+  editorEl.classList.toggle('up', up);
+  const over = r.bottom + (up ? 0 : 56) - bottom;
+  if (over > 0) editorEl.style.top = Math.max(bar.getBoundingClientRect().bottom + 6, r.top - over) + 'px';
+}
+if (window.visualViewport) window.visualViewport.addEventListener('resize', keepEditorVisible);
+
+edText.addEventListener('input', () => {
+  if (editing && editing.kind === 'text') { edText.style.height = 'auto'; edText.style.height = Math.max(3 * editing.size * area.h * 1.25, edText.scrollHeight) + 'px'; }
+});
+edText.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') { e.preventDefault(); closeEditor(false); }
+  else if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); closeEditor(true); }
+});
+$('ed-done').addEventListener('click', () => closeEditor(true));
+$('ed-cancel').addEventListener('click', () => closeEditor(false));
+
+// The on-screen keyboard can leave a full-screen web app shifted when it goes away; put the page back at the top.
+// (The keyboard takes a moment to leave, so it is done again shortly after.)
+function scrollHome() {
+  const home = () => { window.scrollTo(0, 0); document.documentElement.scrollTop = 0; document.body.scrollTop = 0; };
+  home();
+  setTimeout(home, 120);
+  setTimeout(home, 400);
+}
+
+function closeEditor(commit) {
+  if (!editing) return;
+  const e = editing, text = edText.value.replace(/\s+$/, '');
+  editing = null;
+  editorEl.hidden = true;
+  editorEl.classList.remove('up');
+  edText.blur();
+  edText.value = '';
+  scrollHome();
+  if (!commit || !text.trim()) return;   // empty text cancels
+  if (e.kind === 'note') {   // the font size and line breaks are decided here, once, and travel in the op
+    const L = fitNote(text, e.w, e.h);
+    inkOp({ op: 'note', id: board.nextId(), x: e.x, y: e.y, w: e.w, h: e.h, text, color: e.color, fs: Math.round(L.fs * 1e5) / 1e5, lines: L.lines });
+  }
+  else inkOp({ op: 'text', id: board.nextId(), x: e.x, y: e.y, text, color: e.color, size: e.size });
 }
 
 // ---------- Mac -> board messages ----------
@@ -1136,6 +1283,7 @@ function toast(msg, sticky = false) {   // sticky: stays until the next toast re
 function setMode(m) {
   m = m === 'board' && core ? 'board' : 'mouse';
   if (m === mode) return;
+  closeEditor(true);
   mode = m;
   closeWinMenu();
   armZoom(false);
@@ -1164,6 +1312,12 @@ function bUI() {
   for (const b of toolBtns) b.classList.toggle('active', b.dataset.b === bTool);
   for (const b of colorBtns) b.classList.toggle('active', b.dataset.c === bColor);
   for (const b of sizeBtns) b.classList.toggle('active', +b.dataset.s === bSize);
+  if (shapeBtn.dataset.k !== bShape) {   // the Shape button shows the kind that is current
+    shapeBtn.dataset.k = bShape;
+    shapeBtn.innerHTML = `<svg viewBox="0 0 24 24">${SHAPE_ICONS[bShape]}</svg>`;
+    shapeBtn.setAttribute('aria-label', `Shape: ${SHAPE_NAMES[bShape]}`);
+    shapeBtn.title = `Shape: ${SHAPE_NAMES[bShape]}. Drag to draw it, tap again to change kind`;
+  }
   undoBtn.disabled = !board.canUndo();
   redoBtn.disabled = !board.canRedo();
   body.classList.toggle('inked', board.items.length > 0);
@@ -1172,11 +1326,19 @@ function bUI() {
 bar.addEventListener('click', (e) => {   // the palm rule above already swallowed any press made while the Pencil is down
   const b = e.target.closest('[data-m],[data-b],[data-c],[data-s]');
   if (!b) return;
+  closeEditor(b.dataset.b !== 'undo' && b.dataset.b !== 'redo');   // a tap on the toolbar finishes the text being typed; Undo and Redo drop it
   if (b.dataset.m) { setMode(b.dataset.m); return; }
   if (b.dataset.c) { bColor = b.dataset.c; store.set('bcolor', bColor); bUI(); return; }
   if (b.dataset.s) { bSize = +b.dataset.s; store.set('bsize', String(bSize)); bUI(); return; }
   switch (b.dataset.b) {
     case 'pen': case 'marker': case 'eraser':
+      bTool = b.dataset.b; store.set('btool', bTool); bUI();
+      break;
+    case 'shape':   // the first tap picks the tool, each tap after that picks the next kind
+      if (bTool === 'shape') { bShape = SHAPES[(SHAPES.indexOf(bShape) + 1) % SHAPES.length]; store.set('bshape', bShape); }
+      bTool = 'shape'; store.set('btool', bTool); bUI();
+      break;
+    case 'text': case 'note':
       bTool = b.dataset.b; store.set('btool', bTool); bUI();
       break;
     case 'undo': inkOp({ op: 'undo' }); break;

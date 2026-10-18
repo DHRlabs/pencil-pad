@@ -393,13 +393,36 @@ body:not([data-mode="board"]) #board-tools { display: none; }
 }
 #toast.on { opacity: 1; transform: translateX(-50%) translateY(0); }
 
-/* Narrow screens. Labels go first; below about a 10 inch landscape the board tools drop to a second row. */
-@media (max-width: 1260px) {
+/* Text and sticky note editor: a real textarea over the board (Scribble and the keyboard both work), with Cancel and Done under it. */
+#editor { position: fixed; z-index: 14; }
+#editor[hidden] { display: none; }
+#ed-text {
+  display: block; box-sizing: border-box; margin: 0; border: 0; outline: 0; resize: none; overflow: auto;
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", Helvetica, Arial, sans-serif;
+  caret-color: rgb(var(--accent));
+  -webkit-appearance: none; appearance: none;
+  -webkit-user-select: text; user-select: text;
+}
+#ed-bar { position: absolute; right: 0; top: calc(100% + 10px); display: flex; gap: 8px; }
+#editor.up #ed-bar { top: auto; bottom: calc(100% + 10px); }
+#ed-bar button {
+  appearance: none; -webkit-appearance: none; border: 0; margin: 0;
+  height: 38px; padding: 0 18px; border-radius: 12px;
+  font: inherit; font-weight: 700; color: var(--text);
+  background: var(--glass); box-shadow: inset 0 0 0 1px var(--line), 0 6px 22px rgb(0 0 0 / .4);
+  -webkit-backdrop-filter: blur(18px); backdrop-filter: blur(18px);
+  touch-action: manipulation;
+}
+#ed-bar #ed-done { color: #071318; background: rgb(var(--accent)); box-shadow: 0 0 20px rgb(var(--accent) / .4); }
+#ed-bar button:active { transform: scale(.96); }
+
+/* Narrow screens. Labels go first, then the board tools tighten, then below about a 10 inch landscape they drop to a second row. */
+@media (max-width: 1440px) {
   body[data-mode="board"] #status-text,
   body[data-mode="board"] #modes span { display: none; }
 }
-/* The board tools tighten below about 1130px (they did below 900px before Paste joined them), so the one-row bar still fits at 1080. */
-@media (max-width: 1130px) {
+/* The board tools tighten below about 1260px (the one-row bar needs about 1250px at full size), so it still fits at 1180 and 1194. */
+@media (max-width: 1259px) {
   #board-tools .tool { min-width: 40px; padding: 0 4px; }
   #bar .sw { width: 30px; min-width: 30px; }
   #bar .sw i { width: 16px; height: 16px; }
@@ -410,7 +433,7 @@ body:not([data-mode="board"]) #board-tools { display: none; }
   #bar .seg button { min-width: 40px; padding: 0 5px; }
   #modes + .sep { display: none; }
 }
-@media (max-width: 1060px) {
+@media (max-width: 1169px) {
   body[data-mode="board"] #bar {
     flex-wrap: wrap; justify-content: center; row-gap: 3px; box-sizing: border-box;
     width: calc(100vw - 20px - env(safe-area-inset-left, 0px) - env(safe-area-inset-right, 0px));   /* a fixed box would shrink-wrap to half the screen */

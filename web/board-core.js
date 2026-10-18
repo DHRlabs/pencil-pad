@@ -17,6 +17,20 @@ const IMG_ID = /^[0-9a-f]{12}$/;   // a pasted image's id: the name of its file 
 const H_OVER_W = 9 / 16;    // the board is 16:9; y is normalized to the board height
 const PTS_CHUNK = 512;      // most points in one begin/pts op from toOps() (about 13 KB on the wire)
 const TAU = Math.PI * 2;
+const SHAPES = ['line', 'arrow', 'rect', 'ellipse'];
+const TEXT_MAX = 2000, NOTE_MAX = 600;   // most characters in one text label or sticky note
+// Text is a clean system sans. Sizes below are fractions of the board HEIGHT, so a label looks the same
+// at every resolution; layout (line widths, wrapping, fit) is worked out in board-height units from one
+// reference measurement, so the iPad, the Mac window and the 4K export all break lines the same way.
+const FONT = '-apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", Helvetica, Arial, sans-serif';
+const TEXT_WEIGHT = 600, NOTE_WEIGHT = 500;
+const LINE_H = 1.25, NOTE_LINE_H = 1.2;
+// Where each line's baseline sits below the top of its line box, in font sizes. Text is placed by its
+// alphabetic baseline, which every engine defines the same way (the 'top' baseline does not), so the iPad
+// and the Mac window put the same letters in the same place. The values put the text where the editor's
+// textarea shows it.
+const TEXT_BASE = 0.98, NOTE_BASE = 0.956;
+const hexColor = (c, d) => (typeof c === 'string' && /^#[0-9a-f]{6}$/i.test(c) ? c.toLowerCase() : d);
 
 const r5 = (v) => Math.round(v * 1e5) / 1e5;
 const clamp01 = (v) => (v < 0 ? 0 : v > 1 ? 1 : v);
@@ -67,10 +81,124 @@ function drawImages(ctx, w, h, board) {
   ctx.restore();
 }
 
+// ---------- Text layout ----------
+
+let measureCtx = null;
+const widths = new Map();   // `${weight}|${string}` -> width in ems
+function ems(str, weight) {   // width of str when the font size is 1
+  const key = weight + '|' + str;
+  let v = widths.get(key);
+  if (v === undefined) {
+    if (!measureCtx) measureCtx = document.createElement('canvas').getContext('2d');
+    measureCtx.font = `${weight} 100px ${FONT}`;
+    v = measureCtx.measureText(str).width / 100;
+    if (widths.size > 20000) widths.clear();
+    widths.set(key, v);
+  }
+  return v;
+}
+
+// A text label's lines and size in board-height units (1 = the board's height). Wraps on \n only.
+function textBox(it) {
+  if (!it.box) {
+    const lines = it.text.split('\n');
+    let w = 0;
+    for (const l of lines) w = Math.max(w, ems(l, TEXT_WEIGHT) * it.size);
+    it.box = { lines, w, h: lines.length * it.size * LINE_H };
+  }
+  return it.box;
+}
+
+// Words that fit maxW, one paragraph per \n; a word wider than a line is cut by characters.
+function wrapLines(text, fs, maxW) {
+  const out = [];
+  const fits = (str) => ems(str, NOTE_WEIGHT) * fs <= maxW;
+  for (const para of text.split('\n')) {
+    let line = '';
+    for (const word of para.split(' ')) {
+      const joined = line ? line + ' ' + word : word;
+      if (fits(joined)) { line = joined; continue; }
+      if (line) { out.push(line); line = ''; }
+      if (fits(word)) { line = word; continue; }
+      let chunk = '';
+      for (const ch of word) {
+        if (!chunk || fits(chunk + ch)) chunk += ch; else { out.push(chunk); chunk = ch; }
+      }
+      line = chunk;
+    }
+    out.push(line);
+  }
+  return out;
+}
+
+// A sticky note's wrapped lines and font size: the largest size (down to a floor) whose text fits
+// inside the card's padding. Board-height units again. w is the card's width as a fraction of the board
+// width, h its height as a fraction of the board height.
+function fitNote(text, w, h) {
+  const cw = w * 16 / 9, ch = h, pad = Math.min(cw, ch) * 0.1;
+  const iw = cw - 2 * pad, ih = ch - 2 * pad, floor = ch * 0.07;
+  let fs = ch * 0.24, lines;
+  for (;;) {
+    lines = wrapLines(text, fs, iw);
+    if (lines.length * fs * NOTE_LINE_H <= ih || fs <= floor) break;
+    fs = Math.max(floor, fs * 0.92);
+  }
+  return { lines, fs, pad };
+}
+
+// What a note draws with. The iPad measures the text once and sends the result in the note op (`fs` and
+// `lines`), and every board draws from those given values, so no engine ever re-decides where a line
+// breaks. An op without them (an older one) is measured here instead.
+function noteLayout(it) {
+  if (!it.lay) {
+    const pad = Math.min(it.w * 16 / 9, it.h) * 0.1;
+    it.lay = it.given ? { lines: it.given.lines, fs: it.given.fs, pad } : fitNote(it.text, it.w, it.h);
+  }
+  return it.lay;
+}
+
+// The line breaks and font size an op carries for a sticky note, or null if it does not carry usable ones.
+function givenLayout(m) {
+  if (!Array.isArray(m.lines) || typeof m.fs !== 'number' || !isFinite(m.fs) || m.fs <= 0) return null;
+  return { fs: r5(Math.min(0.2, Math.max(0.005, m.fs))), lines: m.lines.slice(0, 80).map((l) => (typeof l === 'string' ? l.slice(0, 300) : '')) };
+}
+
+// ---------- Hit tests (the eraser) ----------
+// All in board-width units: x as is, y scaled by 9/16, so distances are true.
+
+function distToSeg(px, py, ax, ay, bx, by) {
+  const dx = bx - ax, dy = by - ay, len2 = dx * dx + dy * dy;
+  const t = len2 ? Math.min(1, Math.max(0, ((px - ax) * dx + (py - ay) * dy) / len2)) : 0;
+  return Math.hypot(ax + t * dx - px, ay + t * dy - py);
+}
+
+function distToBox(px, py, x0, y0, w, h) {
+  return Math.hypot(Math.max(x0 - px, 0, px - (x0 + w)), Math.max(y0 - py, 0, py - (y0 + h)));
+}
+
+// A shape is hit by its outline (a rectangle's four sides, an ellipse's rim), not its inside.
+function hitShape(s, x, ay, r) {
+  const reach = r + s.size / 2 + 0.001;
+  const ax = s.x0, bx = s.x1, cy0 = s.y0 * H_OVER_W, cy1 = s.y1 * H_OVER_W;
+  if (s.shape === 'line' || s.shape === 'arrow') return distToSeg(x, ay, ax, cy0, bx, cy1) <= reach;
+  if (s.shape === 'rect') {
+    return distToSeg(x, ay, ax, cy0, bx, cy0) <= reach || distToSeg(x, ay, bx, cy0, bx, cy1) <= reach ||
+           distToSeg(x, ay, bx, cy1, ax, cy1) <= reach || distToSeg(x, ay, ax, cy1, ax, cy0) <= reach;
+  }
+  const cx = (ax + bx) / 2, cy = (cy0 + cy1) / 2, rx = Math.abs(bx - ax) / 2, ry = Math.abs(cy1 - cy0) / 2;
+  let px = cx + rx, py = cy;
+  for (let i = 1; i <= 48; i++) {
+    const a = (i / 48) * TAU, qx = cx + rx * Math.cos(a), qy = cy + ry * Math.sin(a);
+    if (distToSeg(x, ay, px, py, qx, qy) <= reach) return true;
+    px = qx; py = qy;
+  }
+  return false;
+}
+
 // ---------- Model ----------
 
 function createBoard() {
-  const items = [];            // everything on the board in order: strokes and images
+  const items = [];            // everything on the board in order: strokes, shapes, text, notes and images
   const byId = new Map();
   const images = new Map();    // decoded pasted images by id (see loadImage)
   const undoStack = [], redoStack = [];
@@ -94,6 +222,13 @@ function createBoard() {
     }
   };
   const pushStep = (step) => { undoStack.push(step); redoStack.length = 0; };
+  // A finished item (shape, text, note): onto the board, one undo step, and the board redraws.
+  const addAndPush = (n) => {
+    addItem(n);
+    if (n.id >= idSeq) idSeq = n.id + 1;
+    pushStep({ k: 'add', s: n });
+    gen++;
+  };
 
   // Let go of decoded images that are neither on the board nor in its undo or redo history, so a long
   // session does not hold dozens of decoded 4K pictures. Runs on reset and clear. (The picture stays on
@@ -166,6 +301,33 @@ function createBoard() {
         loadImage(images, n.img).done.then(() => { gen++; if (board.onImage) board.onImage(); });
         break;
       }
+      case 'shape': {   // a line, arrow, rectangle or ellipse from corner (x0, y0) to corner (x1, y1); one undo step
+        if (!Number.isFinite(m.id) || byId.has(m.id) || !SHAPES.includes(m.kind)) break;
+        addAndPush({
+          kind: 'shape', shape: m.kind, id: m.id,
+          x0: r5(clamp01(num(m.x0, 0))), y0: r5(clamp01(num(m.y0, 0))), x1: r5(clamp01(num(m.x1, 0))), y1: r5(clamp01(num(m.y1, 0))),
+          color: hexColor(m.color, '#ffffff'), size: Math.min(0.05, Math.max(0.0005, num(m.size, 0.0048))), ended: true,
+        });
+        break;
+      }
+      case 'text': {   // a label, top-left at (x, y), size = font size as a fraction of the board height
+        if (!Number.isFinite(m.id) || byId.has(m.id) || typeof m.text !== 'string' || !m.text.trim()) break;
+        addAndPush({
+          kind: 'text', id: m.id, x: r5(clamp01(num(m.x, 0))), y: r5(clamp01(num(m.y, 0))),
+          text: m.text.slice(0, TEXT_MAX), color: hexColor(m.color, '#ffffff'), size: r5(Math.min(0.2, Math.max(0.01, num(m.size, 0.048)))), ended: true,
+        });
+        break;
+      }
+      case 'note': {   // a sticky note, top-left at (x, y); w of the board width, h of its height
+        if (!Number.isFinite(m.id) || byId.has(m.id) || typeof m.text !== 'string' || !m.text.trim()) break;
+        addAndPush({
+          kind: 'note', id: m.id, x: r5(clamp01(num(m.x, 0))), y: r5(clamp01(num(m.y, 0))),
+          w: r5(Math.min(1, Math.max(0.02, num(m.w, 0.09)))), h: r5(Math.min(1, Math.max(0.03, num(m.h, 0.16)))),
+          text: m.text.slice(0, NOTE_MAX), color: hexColor(m.color, '#ffd60a'), ended: true,
+          given: givenLayout(m),
+        });
+        break;
+      }
       case 'pts': {   // points for a stroke that was never begun are ignored
         const s = byId.get(m.id);
         const pts = sanitizePts(m.pts);
@@ -218,6 +380,19 @@ function createBoard() {
         ops.push({ op: 'image', id: s.id, img: s.img, x: s.x, y: s.y, w: s.w, h: s.h });
         continue;
       }
+      if (s.kind === 'shape') {
+        ops.push({ op: 'shape', id: s.id, kind: s.shape, x0: s.x0, y0: s.y0, x1: s.x1, y1: s.y1, color: s.color, size: s.size });
+        continue;
+      }
+      if (s.kind === 'text') {
+        ops.push({ op: 'text', id: s.id, x: s.x, y: s.y, text: s.text, color: s.color, size: s.size });
+        continue;
+      }
+      if (s.kind === 'note') {
+        const L = noteLayout(s);   // a replay carries the layout the note was made with
+        ops.push({ op: 'note', id: s.id, x: s.x, y: s.y, w: s.w, h: s.h, text: s.text, color: s.color, fs: r5(L.fs), lines: L.lines });
+        continue;
+      }
       const head = { op: 'begin', id: s.id, tool: s.tool, color: s.color, size: s.size };
       if (!s.pts.length) ops.push({ ...head, pts: [] });
       for (let i = 0; i < s.pts.length; i += PTS_CHUNK) {
@@ -260,11 +435,22 @@ function createBoard() {
       pruneImages();
       return ops;
     },
-    // Strokes whose path passes within r (a fraction of the board width) of x, y: the eraser.
+    // Items within r (a fraction of the board width) of x, y: the eraser. A stroke by its path, a shape by its
+    // outline, a text label or sticky note by its box. Pasted images are never taken.
     hitTest(x, y, r) {
       const ay = y * H_OVER_W, ids = [];
       for (const s of items) {
         if (s.kind === 'image') continue;   // the eraser never takes a pasted image; undo and clear do
+        if (s.kind === 'shape') { if (hitShape(s, x, ay, r)) ids.push(s.id); continue; }
+        if (s.kind === 'text') {
+          const b = textBox(s);
+          if (distToBox(x, ay, s.x, s.y * H_OVER_W, b.w * H_OVER_W, b.h * H_OVER_W) <= r + 0.001) ids.push(s.id);
+          continue;
+        }
+        if (s.kind === 'note') {
+          if (distToBox(x, ay, s.x, s.y * H_OVER_W, s.w, s.h * H_OVER_W) <= r + 0.001) ids.push(s.id);
+          continue;
+        }
         const pts = s.pts;
         if (!pts.length) continue;
         const reach = r + s.size * (s.tool === 'marker' ? 2.2 : 1) / 2 + 0.001, lim2 = reach * reach;
@@ -401,12 +587,96 @@ function drawBG(ctx, w, h, bg) {
   ctx.restore();
 }
 
-// One item above the images. (Images are drawn first, all together, by drawImages.)
-function drawItem(ctx, w, h, it, bg) {
-  if (it.kind === 'stroke') drawStroke(ctx, w, h, it, bg);
+// A shape in the current ink: a line, an arrow (a line with a filled head that grows with the width),
+// or a rectangle or ellipse outline spanning the two corners.
+function drawShape(ctx, w, h, s, bg) {
+  const lw = Math.max(1, s.size * w), color = inkOn(s.color, bg);
+  const x0 = s.x0 * w, y0 = s.y0 * h, x1 = s.x1 * w, y1 = s.y1 * h;
+  ctx.save();
+  ctx.strokeStyle = color;
+  ctx.fillStyle = color;
+  ctx.lineWidth = lw;
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+  ctx.beginPath();
+  if (s.shape === 'rect') {
+    ctx.rect(Math.min(x0, x1), Math.min(y0, y1), Math.abs(x1 - x0), Math.abs(y1 - y0));
+    ctx.stroke();
+  } else if (s.shape === 'ellipse') {
+    ctx.ellipse((x0 + x1) / 2, (y0 + y1) / 2, Math.abs(x1 - x0) / 2, Math.abs(y1 - y0) / 2, 0, 0, TAU);
+    ctx.stroke();
+  } else if (s.shape === 'arrow') {
+    const len = Math.hypot(x1 - x0, y1 - y0);
+    if (len < 1) { ctx.arc(x1, y1, lw / 2, 0, TAU); ctx.fill(); } else {
+      const ux = (x1 - x0) / len, uy = (y1 - y0) / len;
+      const head = Math.min(len, Math.max(lw * 4.5, w * 0.012));   // head length
+      const bx = x1 - ux * head * 0.8, by = y1 - uy * head * 0.8;   // where the shaft meets the head
+      ctx.moveTo(x0, y0); ctx.lineTo(bx, by);
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.moveTo(x1, y1);
+      ctx.lineTo(x1 - ux * head - uy * head * 0.5, y1 - uy * head + ux * head * 0.5);
+      ctx.lineTo(x1 - ux * head + uy * head * 0.5, y1 - uy * head - ux * head * 0.5);
+      ctx.closePath();
+      ctx.fill();
+    }
+  } else {
+    ctx.moveTo(x0, y0); ctx.lineTo(x1, y1);
+    ctx.stroke();
+  }
+  ctx.restore();
 }
 
-// The whole board from scratch: background, then the images, then every live stroke in order.
+// A text label: top-left at (x, y), one line per \n, in the current ink.
+function drawText(ctx, w, h, it, bg) {
+  const b = textBox(it);
+  ctx.save();
+  ctx.fillStyle = inkOn(it.color, bg);
+  ctx.font = `${TEXT_WEIGHT} ${it.size * h}px ${FONT}`;
+  ctx.textBaseline = 'alphabetic';
+  ctx.textAlign = 'left';
+  b.lines.forEach((l, i) => ctx.fillText(l, it.x * w, (it.y + (i * LINE_H + TEXT_BASE) * it.size) * h));
+  ctx.restore();
+}
+
+// A sticky note: a soft tint of its color on a rounded card with a slight shadow, dark text inside.
+function drawNote(ctx, w, h, it) {
+  const x = it.x * w, y = it.y * h, cw = it.w * w, ch = it.h * h, r = Math.min(cw, ch) * 0.05;
+  const n = parseInt(it.color.slice(1), 16);
+  const tint = (v) => Math.round(v + (255 - v) * 0.7);
+  ctx.save();
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + cw, y, x + cw, y + ch, r);
+  ctx.arcTo(x + cw, y + ch, x, y + ch, r);
+  ctx.arcTo(x, y + ch, x, y, r);
+  ctx.arcTo(x, y, x + cw, y, r);
+  ctx.closePath();
+  ctx.shadowColor = 'rgba(0,0,0,0.4)';
+  ctx.shadowBlur = h * 0.014;
+  ctx.shadowOffsetY = h * 0.006;
+  ctx.fillStyle = `rgb(${tint((n >> 16) & 255)},${tint((n >> 8) & 255)},${tint(n & 255)})`;
+  ctx.fill();
+  ctx.shadowColor = 'rgba(0,0,0,0)';
+  ctx.clip();   // the text never leaves the card, however long it is
+  const L = noteLayout(it);
+  ctx.fillStyle = '#2a2a2c';
+  ctx.font = `${NOTE_WEIGHT} ${L.fs * h}px ${FONT}`;
+  ctx.textBaseline = 'alphabetic';
+  ctx.textAlign = 'left';
+  L.lines.forEach((l, i) => ctx.fillText(l, x + L.pad * h, y + (L.pad + (i * NOTE_LINE_H + NOTE_BASE) * L.fs) * h));
+  ctx.restore();
+}
+
+// One item above the images, in creation order. (Images are drawn first, all together, by drawImages.)
+function drawItem(ctx, w, h, it, bg) {
+  if (it.kind === 'stroke') drawStroke(ctx, w, h, it, bg);
+  else if (it.kind === 'shape') drawShape(ctx, w, h, it, bg);
+  else if (it.kind === 'text') drawText(ctx, w, h, it, bg);
+  else if (it.kind === 'note') drawNote(ctx, w, h, it);
+}
+
+// The whole board from scratch: background, then the images, then every live item in order.
 function render(board, ctx, w, h) {
   drawBG(ctx, w, h, board.bg);
   drawImages(ctx, w, h, board);
@@ -437,5 +707,5 @@ function createView() {
   };
 }
 
-globalThis.PencilBoardCore = { BGS, createBoard, createView, render, drawStroke, drawBG, inkOn };
+globalThis.PencilBoardCore = { BGS, SHAPES, createBoard, createView, render, drawItem, drawStroke, drawBG, inkOn, fitNote };
 })();

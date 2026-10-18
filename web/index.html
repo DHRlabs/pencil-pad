@@ -94,8 +94,17 @@
       <button type="button" class="tool" data-b="marker" title="Marker" aria-label="Marker">
         <svg viewBox="0 0 24 24"><path d="m5 19h14" stroke-width="2.6"/><path d="m7 15.5h10" stroke-width="2.6" opacity=".6"/></svg>
       </button>
-      <button type="button" class="tool" data-b="eraser" title="Eraser: drag over strokes" aria-label="Eraser">
+      <button type="button" class="tool" data-b="eraser" title="Eraser: drag over anything you drew" aria-label="Eraser">
         <svg viewBox="0 0 24 24"><path d="m4.6 15.4 9.9-9.9a2 2 0 0 1 2.8 0l2.2 2.2a2 2 0 0 1 0 2.8L12 20H8.2l-3.6-3.6"/><path d="M12 20h8"/></svg>
+      </button>
+      <button type="button" class="tool" data-b="shape" data-k="line" title="Shape: drag to draw it, tap again to change kind" aria-label="Shape: Line">
+        <svg viewBox="0 0 24 24"><path d="M5 19 19 5"/></svg>
+      </button>
+      <button type="button" class="tool" data-b="text" title="Text: tap the board, type, then Done" aria-label="Text">
+        <svg viewBox="0 0 24 24"><path d="M6 7V5.5h12V7M12 5.5v13M9.5 18.5h5"/></svg>
+      </button>
+      <button type="button" class="tool" data-b="note" title="Sticky note: tap the board, type, then Done" aria-label="Sticky note">
+        <svg viewBox="0 0 24 24"><path d="M5 4.5h14v10l-5 5H5z"/><path d="M14 19.5v-4a1 1 0 0 1 1-1h4"/></svg>
       </button>
       <span class="sep"></span>
       <button type="button" class="sw" data-c="#ffffff" aria-label="White color"><i style="background:#fff"></i></button>
@@ -156,6 +165,15 @@
       <h1>PencilPad is open somewhere else</h1>
       <p>Another page took over the Mac. Tap below to use this one instead.</p>
       <button type="button" id="takeover" class="big">Use here</button>
+    </div>
+  </div>
+
+  <!-- Text and sticky note editor: a real textarea over the board, so Scribble handwriting and the keyboard both work. -->
+  <div id="editor" hidden>
+    <textarea id="ed-text" rows="1" autocapitalize="sentences" autocorrect="off" spellcheck="false" aria-label="Board text"></textarea>
+    <div id="ed-bar">
+      <button type="button" id="ed-cancel">Cancel</button>
+      <button type="button" id="ed-done">Done</button>
     </div>
   </div>
 
