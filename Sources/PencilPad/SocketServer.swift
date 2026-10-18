@@ -38,6 +38,17 @@ final class SocketServer {
     private lazy var board = makeBoard()
     /// Shows where the iPad is zoomed to.
     private lazy var outline = RegionOutline(targets: targets)
+    /// Streams the target area to the iPad while it asks for it.
+    private lazy var projection = Projection(
+        targets: targets, outline: outline,
+        reply: { [weak self] owner, ok, why in
+            guard let self, let c = active, c.id == owner else { return }
+            send(c, why.map { ["t": "show", "ok": ok, "why": $0] } ?? ["t": "show", "ok": ok])
+        },
+        sendFrame: { [weak self] owner, data in
+            guard let self, let c = active, c.id == owner else { return }
+            sendBinary(c, data)
+        })
     /// When the Pencil last reached the Mac (a hover, touch, move or lift, or a zoom change).
     private var lastContact = ProcessInfo.processInfo.systemUptime
     /// The one authenticated client. While there is one, App Nap is held off so input never lags.
@@ -59,6 +70,7 @@ final class SocketServer {
     init(targets: Targets, pen: Pen) {
         self.targets = targets
         self.pen = pen
+        targets.onChange = { [weak self] in self?.projection.retarget() }  // a moved or resized window, another target
     }
 
     func start() {
@@ -301,6 +313,7 @@ final class SocketServer {
             active = nil
             pen.release(reason: "client \(c.id) \(reason)")
             outline.reset()
+            projection.hide()
         }
         log.notice("client \(c.id) closed: \(reason, privacy: .public)")
         let conn = c.conn
@@ -410,8 +423,20 @@ final class SocketServer {
             if let rx = x, let ry = y, let rw = num("w"), let rh = num("h") {
                 let w = min(max(rw, 0.01), 1), h = min(max(rh, 0.01), 1)
                 outline.set(CGRect(x: min(max(rx, 0), 1 - w), y: min(max(ry, 0), 1 - h), width: w, height: h))
+                projection.retarget()
                 lastContact = ProcessInfo.processInfo.systemUptime  // the outline was just on show
             }
+        case "show":
+            // Project the target area onto the iPad as w x h pixel frames, or stop.
+            if msg["on"] as? Bool == true {
+                if let w = num("w").flatMap({ Int(exactly: $0.rounded()) }), let h = num("h").flatMap({ Int(exactly: $0.rounded()) }) {
+                    projection.show(owner: c.id, w: w, h: h)
+                }
+            } else {
+                projection.hide()
+            }
+        case "frame":
+            if let n = num("ack"), n >= 0, n <= Double(UInt32.max) { projection.ack(UInt32(n)) }
         case "key":
             if let name = msg["name"] as? String { pen.key(name) }
         case "ping":
@@ -447,6 +472,16 @@ final class SocketServer {
     private func send(_ c: Client, _ msg: [String: Any]) {
         guard !c.ended else { return }
         write(c.conn, msg)
+    }
+
+    /// One projection frame: a 4-byte big-endian number, then the JPEG.
+    private func sendBinary(_ c: Client, _ data: Data) {
+        guard !c.ended else { return }
+        let meta = NWProtocolWebSocket.Metadata(opcode: .binary)
+        let context = NWConnection.ContentContext(identifier: "binary", metadata: [meta])
+        c.conn.send(content: data, contentContext: context, isComplete: true, completion: .contentProcessed { error in
+            if let error { log.error("frame send failed: \(error, privacy: .public)") }
+        })
     }
 
     private func write(_ conn: NWConnection, _ msg: [String: Any]) {

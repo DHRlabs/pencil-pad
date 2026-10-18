@@ -67,10 +67,19 @@ final class Targets {
     /// so a stroke never continues into a different rect.
     private(set) var current: Target {
         didSet {
-            if current != oldValue { pen.release(reason: "target changed to \(current.name)") }
+            if current != oldValue {
+                pen.release(reason: "target changed to \(current.name)")
+                onChange?()
+            }
             if current.id != "window" { followed = nil }
         }
     }
+    /// Told whenever the target changes: another target, or the same window moved or resized.
+    var onChange: (@MainActor () -> Void)?
+    /// The app that owns the window target.
+    var windowPID: pid_t? { current.id == "window" ? followed?.pid : nil }
+    /// Moves on each time a window is made the target, so "the same window" can be told from "another window".
+    private(set) var windowSerial = 0
     /// The Accessibility element of the window target, kept so the target follows that window.
     private var followed: (element: AXUIElement, pid: pid_t)?
     /// Earliest time the followed window's frame is read again while only hovering.
@@ -294,6 +303,7 @@ final class Targets {
     /// Starts following a window: its frame is read fresh, and no earlier timeout counts against it.
     private func follow(_ element: AXUIElement, _ pid: pid_t) {
         followed = (element, pid)
+        windowSerial += 1
         nextRead = 0
         retryAfter = 0
     }

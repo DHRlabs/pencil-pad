@@ -85,6 +85,22 @@ body[data-style="off"] #fx, body.nofx #fx { display: none; }
 #hint span { font-size: 13px; font-weight: 500; color: var(--muted); }
 body.drawn #hint { opacity: 0; }
 
+/* Show: the Mac's picture of the target, exactly over the active area. It is screen-blended over the effects, whose own
+   background is dimmed inside the area while it shows, so the picture reads and trails and sparks still glow over it. */
+#proj {
+  position: fixed; left: 0; top: 0; width: 0; height: 0; pointer-events: none;
+  mix-blend-mode: screen; opacity: 0; border-radius: 4px;
+  transition: left .28s cubic-bezier(.2,.8,.2,1), top .28s cubic-bezier(.2,.8,.2,1),
+              width .28s cubic-bezier(.2,.8,.2,1), height .28s cubic-bezier(.2,.8,.2,1), opacity .2s ease;
+}
+body.projecting #proj { opacity: 1; }
+body.zooming #proj { transition: opacity .2s ease; }
+body.projecting #hint { opacity: 0; }
+#bar #show.on {
+  color: rgb(var(--accent)); background: rgb(var(--accent) / .14);
+  box-shadow: inset 0 0 0 1px rgb(var(--accent) / .45), 0 0 16px rgb(var(--accent) / .2);
+}
+
 /* Zoom. While a gesture is armed the frame follows the fingers at once instead of gliding. */
 body.zooming #area { transition: none; }
 #zoomhint {
@@ -98,8 +114,15 @@ body.zooming #area { transition: none; }
 body.zoomarmed:not(.zooming) #zoomhint { opacity: 1; }
 /* The zoom level and where the region sits in the target, small, in the corner of the active area. */
 #zoomhud { position: absolute; right: 12px; bottom: 10px; display: none; align-items: center; gap: 8px; opacity: .85; }
-body.zoomed #zoomhud { display: flex; }
-#hud-level { font-size: 11px; font-weight: 600; letter-spacing: .08em; color: rgb(var(--accent) / .8); }
+body.zoomed #zoomhud, body.projecting #zoomhud { display: flex; }
+#minimap, #hud-level { display: none; }
+body.zoomed #minimap { display: block; }
+body.zoomed #hud-level { display: inline; }
+#hud-level, #hud-fps { font-size: 11px; font-weight: 600; letter-spacing: .08em; color: rgb(var(--accent) / .8); }
+#hud-fps:empty { display: none; }
+/* Over a picture the readout needs a backing of its own. */
+body.projecting #zoomhud { padding: 4px 9px; border-radius: 9px; background: rgb(5 6 12 / .62); opacity: 1; }
+body.projecting #area-label { opacity: 0; }
 #minimap { position: relative; border: 1px solid rgb(var(--accent) / .45); border-radius: 3px; background: rgb(255 255 255 / .04); }
 #minimap i { position: absolute; box-sizing: border-box; border: 1.5px solid rgb(var(--accent)); background: rgb(var(--accent) / .22); border-radius: 1px; }
 
@@ -272,6 +295,7 @@ body.fs #fs .off { display: block; }
 /* The Zoom button needs room: on the narrowest iPad portrait widths the Mouse tools take 40 px, as the Board tools do. */
 @media (max-width: 800px) {
   #mouse-tools .tool, #bar #tuck { min-width: 40px; }
+  #mouse-tools { gap: 1px; }
 }
 
 /* Wrong link or taken over elsewhere: the socket stops retrying until the person acts. */

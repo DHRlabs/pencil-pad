@@ -136,6 +136,7 @@ function fit() {
   s.left = area.x + 'px'; s.top = area.y + 'px'; s.width = w + 'px'; s.height = h + 'px';
   areaLabel.textContent = mode === 'board' ? 'Board · 16:9' : targetLabel();
   placeInk();
+  placeProj();
   placeWinMenu();
   if (editing) { layoutEditor(); keepEditorVisible(); }   // rotation or a toolbar wrap moved the board: the editor follows it
   queueRegion();
@@ -334,6 +335,7 @@ function connect() {
   ready = false; macLost();
   if (body.dataset.conn !== 'retry') setConn('connecting', 'Connecting');
   const s = new WebSocket(wsURL);
+  s.binaryType = 'arraybuffer';
   ws = s;
   s.onopen = () => {
     lastRx = performance.now();
@@ -373,11 +375,15 @@ function halt(kind, text) {
 }
 
 function onMessage(data) {
+  if (typeof data !== 'string') { onFrameBytes(data); return; }   // a projection frame
   let m;
   try { m = JSON.parse(data); } catch (_) { return; }
   switch (m.t) {
+    case 'show':
+      onShow(m);
+      break;
     case 'hello':
-      ready = true; backoff = 500; regionSent = '';
+      ready = true; backoff = 500; regionSent = ''; showKey = '';
       screens = Array.isArray(m.screens) ? m.screens : [];
       setConn('live', 'Connected');
       renderTargets();
@@ -469,9 +475,11 @@ function targetLabel() {
 function setTarget(t) {
   if (!t) return;
   const changed = !target || regionKey(target) !== regionKey(t);
+  const kindChanged = !target || showKind(target) !== showKind(t);
   target = t;
   if (t.w > 0 && t.h > 0) store.set('aspect', String(t.w / t.h));
   if (changed) { loadRegion(t); regionSent = ''; }   // that target's own zoom, and the Mac hears it once
+  if (kindChanged) { showOn = showPref(showKind(t)); if (!showOn) clearProj(); updateShowUI(); }   // a window starts showing by itself
   markTarget();
   fit();
 }
@@ -600,7 +608,7 @@ function queueRegion() { if (!regionRaf) regionRaf = requestAnimationFrame(flush
 function flushRegion() {
   regionRaf = 0;
   updateZoomUI();
-  if (mode !== 'mouse' || !target) return;
+  if (mode !== 'mouse' || !target) { syncShow(); return; }
   const v = [region.x, region.y, region.w, region.h].map(r5), s = v.join(',');
   const saved = regionKey(target) + '=' + s;
   if (saved !== regionSaved && !zoomPtrs.size) { regionSaved = saved; store.set('region.' + regionKey(target), s); }   // once, when the fingers lift
@@ -608,6 +616,7 @@ function flushRegion() {
     regionSent = s;
     send(`{"t":"region","x":${v[0]},"y":${v[1]},"w":${v[2]},"h":${v[3]}}`);
   }
+  syncShow();
 }
 
 // The level, and a tiny map of where the region sits in the target.
@@ -715,6 +724,128 @@ zoomBtn.addEventListener('click', () => {
   if (zoomHeld) { zoomHeld = false; return; }   // that press already did its job
   armZoom(!zoomArmed);
 });
+
+// ---------- Show (projection) ----------
+
+// The Mac streams what is under the active area (the window, or the zoomed part of a screen) as JPEG frames. They are
+// drawn on a canvas exactly covering the active area, over the effects (screen-blended, with the effects' own
+// background dimmed inside the area), and each is acknowledged once drawn, so the Mac never has more than two in flight.
+const PROJ_MAX = 2048;   // the longest side asked for, in device pixels
+const proj = $('proj'), projCtx = proj.getContext('2d'), showBtn = $('show'), hudFps = $('hud-fps');
+let showOn = false;                       // what the page wants
+let showKey = '';                         // what the Mac was last told, so a change is sent once
+let projLive = false;                     // frames are arriving
+let projLast = null;                      // the last frame, redrawn when the layer is resized
+let projChain = Promise.resolve();        // frames are drawn in the order they arrive
+let projCount = 0, projTimer = 0, projDrawnAt = 0;
+const PROJ_PEN_MS = 100;   // while the Pencil is down a picture is drawn at most this often (about 10 a second)
+
+const showKind = (t) => (t && t.id === 'window' ? 'window' : 'screen');
+// Windows start on, screens off until tapped; each kind keeps its last choice.
+const showPref = (kind) => { const v = store.get('show.' + kind); return v == null ? kind === 'window' : v === '1'; };
+
+// The active area in device pixels, longest side capped.
+function projSize() {
+  const dpr = window.devicePixelRatio || 1, k = Math.min(1, PROJ_MAX / Math.max(area.w * dpr, area.h * dpr, 1));
+  return [Math.max(1, Math.round(area.w * dpr * k)), Math.max(1, Math.round(area.h * dpr * k))];
+}
+
+function placeProj() {
+  const s = proj.style;
+  s.left = area.x + 'px'; s.top = area.y + 'px'; s.width = area.w + 'px'; s.height = area.h + 'px';
+  const [w, h] = projSize();
+  if (proj.width !== w || proj.height !== h) {
+    proj.width = w; proj.height = h;   // resizing clears the canvas: put the last frame back until the next one comes
+    if (projLast) projCtx.drawImage(projLast, 0, 0, w, h);
+  }
+}
+
+// A page nobody can see must not be fed a picture: hidden (another tab, a locked iPad) or on its way out, Show is off
+// as far as the Mac is concerned; it goes back to the person's choice the moment the page is visible again.
+let pageGone = false;
+const pageHidden = () => document.hidden || pageGone;
+document.addEventListener('visibilitychange', () => syncShow());
+addEventListener('pagehide', () => { pageGone = true; syncShow(); });
+addEventListener('pageshow', () => { pageGone = false; syncShow(); });
+
+// Tells the Mac to start, resize or stop: on a resize, a target change or a region change, once each.
+function syncShow() {
+  const want = showOn && mode === 'mouse' && ready && target && !pageHidden();
+  let key = 'off';
+  if (want) {
+    const [w, h] = projSize();
+    key = `${w}x${h} ${regionKey(target)} ${target.w}x${target.h} ${[region.x, region.y, region.w, region.h].map(r5)}`;
+  }
+  if (key === showKey || (key === 'off' && showKey === '')) return;
+  showKey = key;
+  if (want) { const [w, h] = projSize(); send(`{"t":"show","on":true,"w":${w},"h":${h}}`); }
+  else { send('{"t":"show","on":false}'); }
+}
+
+function updateShowUI() {
+  showBtn.classList.toggle('on', showOn);
+  showBtn.setAttribute('aria-pressed', String(showOn));
+  const live = showOn && projLive && mode === 'mouse';
+  body.classList.toggle('projecting', live);
+  ui.projecting = live;
+}
+
+function clearProj() {
+  projCtx.clearRect(0, 0, proj.width, proj.height);
+  if (projLast) { projLast.close(); projLast = null; }
+  projLive = false; projCount = 0;
+  clearInterval(projTimer); projTimer = 0;
+  hudFps.textContent = '';
+  updateShowUI();
+}
+
+function setShow(on, remember) {
+  showOn = on;
+  if (remember && target) store.set('show.' + showKind(target), on ? '1' : '0');
+  if (!on) clearProj();
+  updateShowUI();
+  syncShow();
+}
+
+showBtn.addEventListener('click', () => setShow(!showOn, true));
+
+// One binary frame: a 4-byte big-endian number, then the JPEG. Acknowledged once drawn (or dropped), always.
+function onFrameBytes(buf) {
+  if (!(buf instanceof ArrayBuffer) || buf.byteLength < 6) return;
+  const n = new DataView(buf).getUint32(0), blob = new Blob([new Uint8Array(buf, 4)], { type: 'image/jpeg' });
+  projChain = projChain.then(() => drawFrame(n, blob));
+}
+
+async function drawFrame(n, blob) {
+  try {
+    // The Pencil's own work comes first: while it is down the next picture waits its turn, and the ack waits with it,
+    // so the Mac holds back (its two-frame limit) and the rate falls by itself; it returns to full the moment the Pencil lifts.
+    if (penId !== -1) {
+      const wait = PROJ_PEN_MS - (performance.now() - projDrawnAt);
+      if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+    }
+    if (showOn && mode === 'mouse' && !pageHidden()) {
+      const bmp = await createImageBitmap(blob);
+      if (showOn) {
+        projCtx.drawImage(bmp, 0, 0, proj.width, proj.height);
+        projDrawnAt = performance.now();
+        if (projLast) projLast.close();
+        projLast = bmp;
+        projCount++;
+        if (!projTimer) projTimer = setInterval(() => { hudFps.textContent = `${projCount} fps`; projCount = 0; }, 1000);
+      } else bmp.close();
+    }
+  } catch (_) {}
+  send(`{"t":"frame","ack":${n}}`);   // the Mac holds the next frames back until it hears this
+}
+
+// The Mac's answer: frames are coming, or why not (the stream is already stopped).
+function onShow(m) {
+  if (m.ok) { projLive = true; updateShowUI(); return; }
+  showOn = false; showKey = 'off';
+  clearProj();
+  toast(m.why || 'The Mac could not show it');
+}
 
 // ---------- Buttons ----------
 
@@ -1031,7 +1162,8 @@ function sendExport(what) {
 // The socket is gone: what the Mac window is doing now is unknown until the next hello brings a state.
 function macLost() {
   closeWinMenu();   // its windows are the old connection's
-  regionSent = '';
+  regionSent = ''; showKey = '';
+  clearProj();
   stateOnConn = false; replayAnswered = false; boardOpen = null;
   syncClosed();
   if (pendingExport) { clearTimeout(pendingExport.timer); pendingExport = null; }
@@ -1287,6 +1419,7 @@ function setMode(m) {
   mode = m;
   closeWinMenu();
   armZoom(false);
+  if (mode === 'board') clearProj();   // fit() below tells the Mac to stop
   store.set('mode', mode);
   if (mode === 'board') {
     setRight(false);   // a right-click armed for the mouse must not wait behind the board

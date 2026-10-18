@@ -52,6 +52,7 @@ uniform vec2 uRes;
 uniform vec4 uArea;
 uniform vec4 uRip[${RIPPLES}];
 uniform vec3 uHover, uBgA, uBgB, uNeb, uGrid;
+uniform float uProj;   // 1 while the Mac's picture is shown over the active area
 
 float hash(vec2 p) { p = fract(p * vec2(123.34, 456.21)); p += dot(p, p + 45.32); return fract(p.x * p.y); }
 float noise(vec2 p) {
@@ -93,6 +94,8 @@ void main() {
   float gi = (line * (0.045 + 0.3 * wv + 0.2 * hv) + node * (0.1 + 0.5 * wv + 0.45 * hv)) * inside * uGridAmt;
   col += uGrid * (gi + (wv * 0.02 + hv * 0.02) * inside);
   col *= 1.0 - 0.38 * smoothstep(0.55, 1.25, r);
+  vec2 pa = px - uArea.xy;   // the picture is screen-blended over this, so the background inside the area steps back
+  col *= 1.0 - 0.92 * uProj * step(0.0, pa.x) * step(0.0, pa.y) * step(pa.x, uArea.z) * step(pa.y, uArea.w);
   gl_FragColor = vec4(col, 1.0);
 }`;
 
@@ -114,10 +117,11 @@ void main() {
 
 const DUST_FS = /* glsl */`
 uniform vec3 uDust;
+uniform float uDim;
 varying float vA;
 void main() {
   vec2 c = gl_PointCoord - 0.5;
-  float a = exp(-dot(c, c) * 14.0) * max(vA, 0.0);
+  float a = exp(-dot(c, c) * 14.0) * max(vA, 0.0) * uDim;
   gl_FragColor = vec4(uDust * a, 1.0);
 }`;
 
@@ -261,7 +265,7 @@ export function start({ canvas, queue, ui }) {
   const bgU = {
     uTime, uDpr, uRes: { value: new Vector2() }, uArea: { value: new Vector4() }, uRip: { value: ripples },
     uHover, uBgA: { value: new Color() }, uBgB: { value: new Color() }, uNeb: { value: new Color() },
-    uGrid: { value: new Color() }, uGridAmt: { value: 1 },
+    uGrid: { value: new Color() }, uGridAmt: { value: 1 }, uProj: { value: 0 },
   };
   const bg = new Mesh(new PlaneGeometry(2, 2), new ShaderMaterial({
     uniforms: bgU, vertexShader: BG_VS, fragmentShader: BG_FS, depthTest: false, depthWrite: false,
@@ -278,7 +282,7 @@ export function start({ canvas, queue, ui }) {
   }
   dg.setAttribute('position', new BufferAttribute(dPos, 3));
   dg.setAttribute('aMisc', new BufferAttribute(dMisc, 3));
-  const dustU = { uTime, uDpr, uView: { value: new Vector2(W, H) }, uHover, uDust: { value: new Color() } };
+  const dustU = { uTime, uDpr, uView: { value: new Vector2(W, H) }, uHover, uDust: { value: new Color() }, uDim: { value: 1 } };
   const dust = new Points(dg, new ShaderMaterial({ uniforms: dustU, vertexShader: DUST_VS, fragmentShader: DUST_FS, ...additive }));
   dust.frustumCulled = false; dust.renderOrder = 1;
   scene.add(dust);
@@ -512,6 +516,8 @@ export function start({ canvas, queue, ui }) {
 
     const a = ui.area;
     bgU.uArea.value.set(a.x, a.y, a.w, a.h);
+    bgU.uProj.value += ((ui.projecting ? 1 : 0) - bgU.uProj.value) * (1 - Math.exp(-dt * 8));
+    dustU.uDim.value = 1 - 0.85 * bgU.uProj.value;
     uTime.value = t;
 
     // Idle (nothing alive, no pen): draw every third frame, so 20 fps on a 60 Hz display, 40 fps on 120 Hz.

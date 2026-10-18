@@ -26,13 +26,14 @@
 </head>
 <body data-style="neon" data-conn="connecting">
   <canvas id="fx" aria-hidden="true"></canvas>
+  <canvas id="proj" aria-hidden="true"></canvas>
   <canvas id="ink" aria-hidden="true"></canvas>
   <div id="surface" aria-label="Drawing surface"></div>
 
   <div id="area" aria-hidden="true">
     <i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
     <span id="area-label"></span>
-    <div id="zoomhud"><div id="minimap"><i></i></div><span id="hud-level"></span></div>
+    <div id="zoomhud"><span id="hud-fps"></span><div id="minimap"><i></i></div><span id="hud-level"></span></div>
     <div id="zoomhint">Pinch to zoom, drag to move</div>
     <div id="hint">
       <strong>Draw with Apple Pencil</strong>
@@ -67,6 +68,9 @@
       <button type="button" class="tool text" data-key="escape" title="Escape" aria-label="Escape">esc</button>
       <button type="button" class="tool" id="rclick" title="Right-click the next Pencil tap" aria-label="Right-click next tap" aria-pressed="false">
         <svg viewBox="0 0 24 24"><rect x="6" y="3" width="12" height="18" rx="6"/><path d="M12 3v7"/><path class="fill" d="M12 3.2a5.8 5.8 0 0 1 5.8 5.8v1H12z"/></svg>
+      </button>
+      <button type="button" class="tool" id="show" title="Show: the Mac's picture of this window or screen, on the iPad" aria-label="Show" aria-pressed="false">
+        <svg viewBox="0 0 24 24"><path d="M2.5 12s3.6-6.5 9.5-6.5 9.5 6.5 9.5 6.5-3.6 6.5-9.5 6.5S2.5 12 2.5 12Z"/><circle cx="12" cy="12" r="2.8"/></svg>
       </button>
       <button type="button" class="tool" id="zoom" title="Zoom: tap, then pinch or drag with your fingers. Hold to show the whole screen" aria-label="Zoom" aria-pressed="false">
         <svg viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6.3"/><path d="m15.2 15.2 5 5M10.5 7.6v5.8M7.6 10.5h5.8"/></svg>
