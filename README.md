@@ -86,4 +86,4 @@ The Mac app serves the iPad page over HTTP on port 8710 and takes Pencil input o
 
 ## License
 
-License: to be decided.
+PencilPad is licensed under the [GNU General Public License v3.0](LICENSE). The bundled three.js is MIT; its license is in `web/vendor/LICENSE-three.txt`.
