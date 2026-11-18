@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>PencilPad Annotate</title>
+<link rel="icon" href="data:,">
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: transparent; }
+  canvas { position: fixed; inset: 0; width: 100%; height: 100%; display: block; pointer-events: none; }
+</style>
+</head>
+<body>
+<canvas id="ink"></canvas>
+<!-- Classic script on purpose, like board.html. -->
+<script src="board-core.js"></script>
+<script>
+// PencilPad Annotate overlay (Mac, WKWebView over the target window): a transparent page that shows the
+// Pencil's marks on the Mac, drawn by the same board-core.js the iPad uses. It is only handed the annot
+// ops (see AGENTS.md); x, y are 0 to 1 of the window, so the ink follows a moved or resized window.
+(() => {
+  const { createBoard, renderInk } = PencilBoardCore;
+
+  const canvas = document.getElementById('ink');
+  const ctx = canvas.getContext('2d');
+  const board = createBoard();
+  let timer = 0, lastDraw = 0;
+
+  // A timer, not requestAnimationFrame: WebKit pauses animation frames for a window it thinks is hidden or covered.
+  function schedule() {
+    if (timer) return;
+    timer = setTimeout(() => { timer = 0; draw(); }, Math.max(0, 12 - (performance.now() - lastDraw)));
+  }
+
+  function draw() {
+    lastDraw = performance.now();
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    if (canvas.width > 0 && canvas.height > 0) renderInk(board, ctx, canvas.width, canvas.height);
+  }
+
+  function resize() {
+    const dpr = Math.min(2, window.devicePixelRatio || 1);
+    canvas.width = Math.max(1, Math.round(window.innerWidth * dpr));
+    canvas.height = Math.max(1, Math.round(window.innerHeight * dpr));
+    draw();
+  }
+
+  window.PencilAnnot = {
+    // One annot op (begin, pts, end, clear), as the Mac received it from the page.
+    apply(msg) {
+      if (!msg || typeof msg !== 'object') return;
+      board.apply(msg.op === 'clear' ? { op: 'reset' } : msg);
+      schedule();
+    },
+    // The marks alone, transparent, as a PNG data URL w by h pixels (for Save, which lays them over the window's picture).
+    png(w, h) {
+      const off = document.createElement('canvas');
+      off.width = w; off.height = h;
+      renderInk(board, off.getContext('2d'), w, h);
+      return off.toDataURL('image/png');
+    },
+    count: () => board.items.length,
+  };
+
+  window.addEventListener('resize', resize);
+  resize();
+})();
+</script>
+</body>
+</html>

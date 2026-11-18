@@ -110,6 +110,8 @@ final class Targets {
     private var followWaiters: [@MainActor () -> Void] = []
     /// Told when a window target's resize, or its disappearance, changed what the page shows.
     var onFollowChange: (@MainActor () -> Void)?
+    /// Told whenever a window is made the target, even the one that already was.
+    var onWindowChosen: (@MainActor () -> Void)?
 
     init(pen: Pen) {
         self.pen = pen
@@ -273,6 +275,7 @@ final class Targets {
         windowSerial += 1
         nextRead = 0
         retryAfter = 0
+        onWindowChosen?()
     }
 
     /// A window target follows its window. Its frame is read on the Accessibility queue, at most every 250 ms (`force`

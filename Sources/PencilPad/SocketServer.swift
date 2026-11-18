@@ -40,6 +40,15 @@ final class SocketServer {
     private lazy var board = makeBoard()
     /// Shows where the iPad is zoomed to.
     private lazy var outline = RegionOutline(targets: targets)
+    /// Mouse mode's Annotate: the marks over the window target.
+    private lazy var annotation: Annotation = {
+        let annotation = Annotation(targets: targets)
+        annotation.onReset = { [weak self] in
+            guard let self, let c = active else { return }
+            send(c, ["t": "annot", "op": "reset"])
+        }
+        return annotation
+    }()
     /// Streams the target area to the iPad while it asks for it.
     private lazy var projection = Projection(
         targets: targets, outline: outline,
@@ -75,7 +84,11 @@ final class SocketServer {
     init(targets: Targets, pen: Pen) {
         self.targets = targets
         self.pen = pen
-        targets.onChange = { [weak self] in self?.projection.retarget() }  // a moved or resized window, another target
+        targets.onChange = { [weak self] in  // a moved or resized window, another target
+            self?.projection.retarget()
+            self?.annotation.retarget()
+        }
+        targets.onWindowChosen = { [weak self] in self?.annotation.windowChosen() }
         targets.onFollowChange = { [weak self] in self?.pushTarget() }  // the window was resized, or went away
     }
 
@@ -121,6 +134,33 @@ final class SocketServer {
     func pushTarget() {
         guard let c = active else { return }
         send(c, ["t": "target", "target": targets.current.json])
+    }
+
+    // MARK: Annotate
+
+    /// begin, pts and end draw; clear empties; save writes the window's picture with the marks. The marks are the
+    /// Pencil in use, so they keep the window's frame fresh like a hover does.
+    private func handleAnnot(_ c: Client, _ msg: [String: Any]) {
+        switch msg["op"] as? String {
+        case "begin", "pts", "end":
+            lastContact = ProcessInfo.processInfo.systemUptime
+            if !pencilActive {
+                pencilActive = true
+                targets.followWindow(force: true)
+            }
+            annotation.apply(msg)
+        case "clear":
+            annotation.clear()
+        case "save":
+            Task {
+                let (name, why) = await annotation.save()
+                log.notice("annotate save: \(name ?? "failed: \(why ?? "")", privacy: .public)")
+                send(c, name.map { ["t": "annot", "op": "done", "ok": true, "name": $0] }
+                    ?? ["t": "annot", "op": "done", "ok": false, "why": why ?? "Save failed"])
+            }
+        default:
+            log.debug("client \(c.id): unknown annot op \(msg["op"] as? String ?? "", privacy: .public)")
+        }
     }
 
     // MARK: Board
@@ -240,14 +280,14 @@ final class SocketServer {
         }
     }
 
-    /// Writes the PNG to the Desktop as "PencilPad Board <yyyy-MM-dd at HH.mm.ss>.png" in local time and
+    /// Writes the PNG to the Desktop as "PencilPad <kind> <yyyy-MM-dd at HH.mm.ss>.png" in local time and
     /// returns the file name. A name that is taken (two saves in one second) gets " 2", " 3" before the
     /// extension; the write itself refuses to overwrite, so concurrent saves cannot collide.
-    private nonisolated static func saveToDesktop(_ data: Data) throws -> String {
+    nonisolated static func saveToDesktop(_ data: Data, kind: String = "Board") throws -> String {
         let clock = DateFormatter()
         clock.locale = Locale(identifier: "en_US_POSIX")  // the format is part of the name, not the locale
         clock.dateFormat = "yyyy-MM-dd 'at' HH.mm.ss"
-        let stem = "PencilPad Board \(clock.string(from: Date()))"
+        let stem = "PencilPad \(kind) \(clock.string(from: Date()))"
         let desktop = FileManager.default.urls(for: .desktopDirectory, in: .userDomainMask)[0]
         var n = 1
         while true {
@@ -344,6 +384,8 @@ final class SocketServer {
         for c in Array(clients.values) where !c.authed && now - c.opened >= Self.idleLimit {
             end(c, reason: "no valid hello within \(Int(Self.idleLimit)) s", closeFrame: true)
         }
+        // Marks on show follow their window even while no one is drawing or connected.
+        if annotation.strokes > 0 { targets.followWindow() }
         guard let c = active else { return }
         if pencilActive, pen.held == nil, now - lastContact >= Self.quietAfter {
             pencilActive = false
@@ -485,6 +527,8 @@ final class SocketServer {
             handleBoard(c, msg)
         case "ink":
             forwardInk(msg)
+        case "annot":
+            handleAnnot(c, msg)
         case "hello":
             break
         default:
@@ -515,6 +559,7 @@ final class SocketServer {
         log.notice("hello accepted: client \(c.id)")
         send(c, ["t": "hello", "screens": targets.screens.map(\.json), "target": targets.current.json])
         reportBoard(to: c)  // the page never relies on a remembered window state
+        send(c, ["t": "annot", "op": "state", "n": annotation.strokes])  // the marks outlive a connection; the page matches them
     }
 
     private func deny(_ c: Client, why: String) {

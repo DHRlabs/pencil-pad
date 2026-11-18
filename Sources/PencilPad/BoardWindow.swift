@@ -235,7 +235,7 @@ private final class PageMessages: NSObject, WKScriptMessageHandler {
 /// correct content types instead of the opaque origin a file: page has. (The page uses classic scripts;
 /// ES modules between file: URLs would not run at all.)
 @MainActor
-private final class BoardPages: NSObject, WKURLSchemeHandler {
+final class BoardPages: NSObject, WKURLSchemeHandler {
     static let scheme = "pencilpad-board"
     /// A host is needed so the page and its modules share one origin.
     static let pageURL = URL(string: "\(scheme)://board/board.html")!

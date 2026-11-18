@@ -48,6 +48,8 @@ Everything runs on your own network. Nothing loads from the internet while you u
 - Mouse mode and Board mode, picked on the iPad.
 - Board window made for sharing in a video call.
 - Show mode projects a Mac window or screen onto the iPad.
+- Annotate: mark up a Mac window with the Pencil. The marks show on the Mac (and so on a projector or in a shared screen) and on the iPad, and one tap saves a PNG of the window with the marks to the Desktop.
+- Clear the marks with one tap and move on to the next page.
 - Undo, redo, and Escape buttons send those keys to the Mac.
 - Menu bar app with no Dock icon. It opens at login once it is installed in Applications.
 

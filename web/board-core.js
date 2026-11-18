@@ -683,6 +683,12 @@ function render(board, ctx, w, h) {
   for (const s of board.items) drawItem(ctx, w, h, s, board.bg);
 }
 
+// Only the live items over whatever is already on the canvas (no background, no images): Mouse mode's Annotate
+// layer, drawn the same way on the iPad and in the Mac's overlay window. The ink is drawn as on a dark board, so only black would change.
+function renderInk(board, ctx, w, h) {
+  for (const s of board.items) drawItem(ctx, w, h, s, 'ink');
+}
+
 // The same picture, cheaper, for a canvas that redraws as strokes arrive. Background, images and
 // finished strokes live in a cached layer that is rebuilt only when something already drawn changes
 // (undo, redo, erase, clear, background, reset, resize, an image added or finished loading); the
@@ -707,5 +713,5 @@ function createView() {
   };
 }
 
-globalThis.PencilBoardCore = { BGS, SHAPES, createBoard, createView, render, drawItem, drawStroke, drawBG, inkOn, fitNote };
+globalThis.PencilBoardCore = { BGS, SHAPES, createBoard, createView, render, renderInk, drawItem, drawStroke, drawBG, inkOn, fitNote };
 })();

@@ -459,7 +459,7 @@ final class Projection {
     }
 
     /// The SCWindow that is the target: same app, and the frame the Accessibility API reported.
-    private static func match(_ windows: [SCWindow], pid: pid_t, rect: CGRect) -> SCWindow? {
+    static func match(_ windows: [SCWindow], pid: pid_t, rect: CGRect) -> SCWindow? {
         func gap(_ w: SCWindow) -> CGFloat {
             abs(w.frame.minX - rect.minX) + abs(w.frame.minY - rect.minY) + abs(w.frame.width - rect.width) + abs(w.frame.height - rect.height)
         }
