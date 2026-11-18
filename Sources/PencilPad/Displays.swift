@@ -89,10 +89,17 @@ final class Targets {
     var onChange: (@MainActor () -> Void)?
     /// The app that owns the window target.
     var windowPID: pid_t? { current.id == "window" ? followed?.pid : nil }
+    /// The window server's number for the window target, when it could be read: the one name that tells two windows of
+    /// one app apart however alike their title and frame are.
+    var windowID: CGWindowID? { current.id == "window" ? followed?.windowID : nil }
     /// Moves on each time a window is made the target, so "the same window" can be told from "another window".
     private(set) var windowSerial = 0
+    /// Numbers every target choice (a screen, the front window, a pick, a window that went away), starting from a random
+    /// base so a page that outlives a relaunch never mistakes the new count for its own. It rides the `target` and `annot`
+    /// messages: the Mac drops any mark stamped with another number.
+    private(set) var generation = Int.random(in: 1 << 20..<1 << 30)
     /// The Accessibility element of the window target, kept so the target follows that window.
-    private var followed: (element: AXUIElement, pid: pid_t)?
+    private var followed: (element: AXUIElement, pid: pid_t, windowID: CGWindowID?)?
     /// Earliest time the followed window's frame is read again while only hovering.
     private var nextRead: TimeInterval = 0
     /// An app that did not answer is not asked again before this, not even for a Pencil down.
@@ -110,8 +117,8 @@ final class Targets {
     private var followWaiters: [@MainActor () -> Void] = []
     /// Told when a window target's resize, or its disappearance, changed what the page shows.
     var onFollowChange: (@MainActor () -> Void)?
-    /// Told whenever a window is made the target, even the one that already was.
-    var onWindowChosen: (@MainActor () -> Void)?
+    /// Told after every target choice (see `generation`), even one that picked what was already the target.
+    var onChoice: (@MainActor () -> Void)?
 
     init(pen: Pen) {
         self.pen = pen
@@ -144,6 +151,7 @@ final class Targets {
         current = Target(id: screen.id, name: screen.name, rect: screen.bounds)
         Settings.targetScreenID = screen.id
         log.notice("target: \(self.current.name, privacy: .public) \(self.current.id, privacy: .public) rect \(NSStringFromRect(self.current.rect), privacy: .public)")
+        choose()
         return true
     }
 
@@ -214,6 +222,7 @@ final class Targets {
             let stale = !choices.isCurrent(mine)
             let box = stale ? nil : AXWindows.focusedWindow(pid: pid, name: name)
             let target = box.flatMap { AXWindows.windowTarget($0.element, app: name) }
+            let windowID = box.flatMap { AXWindows.windowID($0.element) }
             DispatchQueue.main.async {
                 MainActor.assumeIsolated {
                     guard let self else { done(false); return }
@@ -224,7 +233,7 @@ final class Targets {
                     }
                     guard let box, let target else { done(false); return }
                     self.current = target
-                    self.follow(box.element, pid)
+                    self.follow(box.element, pid, windowID: windowID)
                     log.notice("target: \(self.current.name, privacy: .public) \(self.current.id, privacy: .public) rect \(NSStringFromRect(self.current.rect), privacy: .public)")
                     done(true)
                 }
@@ -249,6 +258,7 @@ final class Targets {
             // overtaken pick neither raises its window nor keeps the queue busy behind a slow app.
             let codes = AXWindows.raise(info, isCurrent: { choices.isCurrent(mine) })
             let target = choices.isCurrent(mine) ? AXWindows.windowTarget(info.element, app: info.app) : nil
+            let windowID = target == nil ? nil : AXWindows.windowID(info.element)
             DispatchQueue.main.async {
                 MainActor.assumeIsolated {
                     guard let self else { done(false); return }
@@ -261,7 +271,7 @@ final class Targets {
                     log.notice("pick \(n): \(info.app, privacy: .public) frontmost \(codes.frontmost.rawValue) raise \(codes.raised.rawValue) main \(codes.main.rawValue) activate \(activated)")
                     guard let target else { done(false); return }
                     self.current = target
-                    self.follow(info.element, info.pid)
+                    self.follow(info.element, info.pid, windowID: windowID)
                     log.notice("target: \(self.current.name, privacy: .public) picked from the window list, rect \(NSStringFromRect(self.current.rect), privacy: .public)")
                     done(true)
                 }
@@ -270,12 +280,18 @@ final class Targets {
     }
 
     /// Starts following a window: its frame is read fresh, and no earlier timeout counts against it.
-    private func follow(_ element: AXUIElement, _ pid: pid_t) {
-        followed = (element, pid)
+    private func follow(_ element: AXUIElement, _ pid: pid_t, windowID: CGWindowID?) {
+        followed = (element, pid, windowID)
         windowSerial += 1
         nextRead = 0
         retryAfter = 0
-        onWindowChosen?()
+        choose()
+    }
+
+    /// A target choice took effect: marks and pictures made for the one before are no longer this one's.
+    private func choose() {
+        generation += 1
+        onChoice?()
     }
 
     /// A window target follows its window. Its frame is read on the Accessibility queue, at most every 250 ms (`force`
@@ -333,9 +349,14 @@ final class Targets {
         guard let main = screens.first(where: \.main) ?? screens.first else { return }
         log.notice("target: window \(self.current.name, privacy: .public) is gone; back to \(main.name, privacy: .public)")
         current = Target(id: main.id, name: main.name, rect: main.bounds)  // didSet releases a held button and drops the window
+        choose()
         onFollowChange?()
     }
 }
+
+/// The window-server number of an Accessibility window (not in the public headers; the same call window managers use).
+@_silgen_name("_AXUIElementGetWindow")
+private func _AXUIElementGetWindow(_ element: AXUIElement, _ id: UnsafeMutablePointer<CGWindowID>) -> AXError
 
 /// All the Accessibility reads and actions on other apps' windows. Nothing here touches the Targets' state, so it all
 /// runs on `queue`, one call after another; the 0.5 s messaging timeout bounds what a stuck app can cost.
@@ -447,6 +468,12 @@ private enum AXWindows {
         guard isCurrent() else { return (frontmost, raised, skipped) }
         let main = AXUIElementSetAttributeValue(info.element, kAXMainAttribute as CFString, kCFBooleanTrue)
         return (frontmost, raised, main)
+    }
+
+    /// The window server's number for an Accessibility window, or nil when the system will not say.
+    static func windowID(_ window: AXUIElement) -> CGWindowID? {
+        var id = CGWindowID(0)
+        return _AXUIElementGetWindow(window, &id) == .success && id != 0 ? id : nil
     }
 
     /// The window's frame, or the AX error that stopped the read.

@@ -248,6 +248,10 @@ final class Projection {
     private var restarts = 0
     /// Counts streams, so a frame or a stop that arrives late from an earlier one is ignored.
     private var generation = 0
+    /// The newest revision the page stamped on a `show` or `region` (16 bits), and the one the running stream has been set to.
+    /// Each frame carries the applied one, so the page can tell a picture of the part it zoomed away from and not draw it.
+    private var requestedRev: UInt16 = 0
+    private var appliedRev: UInt16 = 0
 
     init(targets: Targets, outline: RegionOutline, reply: @escaping (Int, Bool, String?) -> Void, sendFrame: @escaping (Int, Data) -> Void) {
         self.targets = targets
@@ -257,9 +261,10 @@ final class Projection {
     }
 
     /// `show` on: start, or re-fit a running stream to a new size.
-    func show(owner: Int, w: Int, h: Int) {
+    func show(owner: Int, w: Int, h: Int, rev: UInt16) {
         if self.owner != owner { retireStream() }  // another page's frames never carry over
         self.owner = owner
+        requestedRev = rev
         want = (min(max(w, 64), 8192), min(max(h, 64), 8192))
         // Screen Recording: ask once. After that the answer can stay "no" until PencilPad is relaunched, so the
         // stream is simply tried and ScreenCaptureKit's own refusal is what gets reported.
@@ -280,8 +285,9 @@ final class Projection {
         reconcileSoon(delay: 0)
     }
 
-    /// The target, its size, or the zoomed region changed.
-    func retarget() {
+    /// The target, its size, or the zoomed region changed. `rev` is the page's stamp on a region change.
+    func retarget(rev: UInt16? = nil) {
+        if let rev { requestedRev = rev }
         if want != nil { reconcileSoon() }
     }
 
@@ -327,13 +333,15 @@ final class Projection {
         config.showsCursor = true
         config.queueDepth = 3
         config.ignoreShadowsSingleWindow = true
+        config.ignoreGlobalClipSingleWindow = true  // a window half past the screen's edge is captured whole, as the ink spans all of it
         return (config, "\(width)x\(height) \(Int(source.minX.rounded())),\(Int(source.minY.rounded())) \(Int(source.width.rounded()))x\(Int(source.height.rounded()))")
     }
 
     private func reconcileOnce() async {
         guard let want else { await stopStream(); return }
+        let rev = requestedRev
         let target = targets.current, region = outline.region ?? CGRect(x: 0, y: 0, width: 1, height: 1)
-        let identity = target.id == "window" ? "window #\(targets.windowSerial) pid \(targets.windowPID ?? 0)" : "display \(target.id)"
+        let identity = target.id == "window" ? "window #\(targets.windowSerial) pid \(targets.windowPID ?? 0) id \(targets.windowID ?? 0)" : "display \(target.id)"
         do {
             let (config, key) = Self.configuration(base: target.rect.size, region: region, want: want)
             // The same window or screen, only its size or the zoomed region changed: retune the stream, look nothing up.
@@ -343,13 +351,14 @@ final class Projection {
                     applied = key
                     log.notice("projection: reconfigured \(identity, privacy: .public) \(key, privacy: .public)")
                 }
+                appliedRev = rev
                 return
             }
             log.notice("projection: looking up capturable windows and screens")
             let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: target.id != "window")
             let filter: SCContentFilter
             if target.id == "window" {
-                guard let pid = targets.windowPID, let window = Self.match(content.windows, pid: pid, rect: target.rect) else {
+                guard let pid = targets.windowPID, let window = Self.match(content.windows, id: targets.windowID, pid: pid, rect: target.rect) else {
                     fail("That window can't be shown right now"); return
                 }
                 filter = SCContentFilter(desktopIndependentWindow: window)
@@ -363,6 +372,7 @@ final class Projection {
             }
             await stopStream()
             try await startStream(filter: filter, config: config, identity: identity, key: key, what: target.name)
+            appliedRev = rev
         } catch {
             if Self.isPermissionRefusal(error) {
                 log.error("projection: Screen Recording is not allowed for PencilPad")
@@ -432,8 +442,9 @@ final class Projection {
         let n = nextFrame
         nextFrame &+= 1
         sink.sent(n)
-        var frame = Data(capacity: data.count + 4)
-        frame.append(contentsOf: [UInt8(n >> 24 & 0xff), UInt8(n >> 16 & 0xff), UInt8(n >> 8 & 0xff), UInt8(n & 0xff)])
+        var frame = Data(capacity: data.count + 6)
+        frame.append(contentsOf: [UInt8(n >> 24 & 0xff), UInt8(n >> 16 & 0xff), UInt8(n >> 8 & 0xff), UInt8(n & 0xff),
+                                  UInt8(appliedRev >> 8), UInt8(appliedRev & 0xff)])
         frame.append(data)
         sendFrame(owner, frame)
     }
@@ -458,13 +469,15 @@ final class Projection {
         reconcileSoon(delay: 0)
     }
 
-    /// The SCWindow that is the target: same app, and the frame the Accessibility API reported.
-    static func match(_ windows: [SCWindow], pid: pid_t, rect: CGRect) -> SCWindow? {
+    /// The SCWindow that is the target: the one with the window server's number the pick recorded. Only when that number could
+    /// not be read does it fall back to the same app's window at the frame the Accessibility API reported, and then only if
+    /// exactly one window qualifies: two alike are ambiguous and match nothing.
+    static func match(_ windows: [SCWindow], id: CGWindowID?, pid: pid_t, rect: CGRect) -> SCWindow? {
+        if let id { return windows.first { $0.windowID == id && $0.owningApplication?.processID == pid } }
         func gap(_ w: SCWindow) -> CGFloat {
             abs(w.frame.minX - rect.minX) + abs(w.frame.minY - rect.minY) + abs(w.frame.width - rect.width) + abs(w.frame.height - rect.height)
         }
-        return windows.filter { $0.owningApplication?.processID == pid && $0.windowLayer == 0 }
-            .min { gap($0) < gap($1) }
-            .flatMap { gap($0) < 12 ? $0 : nil }
+        let near = windows.filter { $0.owningApplication?.processID == pid && $0.windowLayer == 0 && gap($0) < 12 }
+        return near.count == 1 ? near[0] : nil
     }
 }

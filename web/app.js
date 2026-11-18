@@ -59,6 +59,7 @@ let screens = [], target = null;
 const cam = { z: 1, cx: 0.5, cy: 0.5 };    // the zoom camera, see Zoom below
 let region = { x: 0, y: 0, w: 1, h: 1 };   // the part of the target the active area shows, 0 to 1 of the target
 let regionRaf = 0, regionSent = '';        // the animation frame that will send it, and what the Mac last heard
+let projRev = 0;                           // stamps each region and show message; a frame comes back carrying the stamp it was made for
 let regionSaved = '';                      // what localStorage holds for the current target, so it is only written when it changes
 let penId = -1, stroke = false, lastX = 0, lastY = 0, lastSX = 0, lastSY = 0;
 let aiming = false, aimX = 0, aimY = 0, aimP = 0, aimPending = false;   // Pencil touching below the aim threshold
@@ -200,7 +201,7 @@ function onDown(e) {
   e.preventDefault();
   try { surface.setPointerCapture(penId); } catch (_) {}
   if (mode === 'board') { boardDown(e, x, y); return; }   // Board: ink, never mouse
-  if (annotOn) { annotDown(e, x, y); return; }              // Annotate: ink over the window, never mouse
+  if (annotOn) { if (annotReady) annotDown(e, x, y); return; }   // Annotate: ink over the window, never mouse (and not while matching up after a connect)
   if (p >= aimAt()) pressAt(x, y, p);
   else { aiming = true; aimX = x; aimY = y; aimP = p; aimPending = true; flushAim(); }
   if (!body.classList.contains('drawn')) body.classList.add('drawn');
@@ -234,7 +235,7 @@ function onMove(e) {
   if (e.pointerId === penId) {
     if (e.buttons === 0) { onUp(e); return; }   // lifted without a pointerup: release now
     if (mode === 'board') { boardMove(e); return; }   // Board: ink locally, no mouse messages
-    if (annotLive !== null) { annotMove(e); return; }
+    if (annotOn) { if (annotLive !== null) annotMove(e); return; }
     const list = hasCoalesced ? e.getCoalescedEvents() : null;
     if (list && list.length) for (let i = 0; i < list.length; i++) contactPoint(list[i]);
     else contactPoint(e);
@@ -251,7 +252,7 @@ function onMove(e) {
 function onUp(e) {
   if (e.pointerId !== penId) return;
   if (mode === 'board') { boardUp(e); return; }
-  if (annotLive !== null) { annotLift(); penId = -1; hoverStart = 0; hoverCount = 0; return; }
+  if (annotOn || annotLive !== null) { annotLift(e); penId = -1; hoverStart = 0; hoverCount = 0; return; }
   if (e.type === 'pointerup' || e.type === 'pointermove') { lastX = toTargetX(normX(e.clientX)); lastY = toTargetY(normY(e.clientY)); }
   if (stroke) send(`{"t":"up","x":${lastX},"y":${lastY}}`);   // an aim-only touch sends nothing on lift
   stroke = false; penId = -1; aiming = false; aimPending = false; hoverStart = 0; hoverCount = 0;
@@ -486,11 +487,13 @@ function setTarget(t) {
   const changed = !target || regionKey(target) !== regionKey(t);
   const kindChanged = !target || showKind(target) !== showKind(t);
   target = t;
+  const wasMarked = annotAdopt(t.gen);   // another target choice than the marks were drawn for: they are gone
   if (t.w > 0 && t.h > 0) store.set('aspect', String(t.w / t.h));
   if (changed) { loadRegion(t); regionSent = ''; }   // that target's own zoom, and the Mac hears it once
   if (kindChanged) { showOn = showPref(showKind(t)); if (!showOn) clearProj(); updateShowUI(); }   // a window starts showing by itself
   markTarget();
   if (showKind(t) !== 'window') annotDrop();   // a screen cannot be marked
+  if (wasMarked) toast('Marks cleared: the target changed');
   annotUI();
   fit();
 }
@@ -625,7 +628,7 @@ function flushRegion() {
   if (saved !== regionSaved && !zoomPtrs.size) { regionSaved = saved; store.set('region.' + regionKey(target), s); }   // once, when the fingers lift
   if (ready && s !== regionSent) {
     regionSent = s;
-    send(`{"t":"region","x":${v[0]},"y":${v[1]},"w":${v[2]},"h":${v[3]}}`);
+    send(`{"t":"region","x":${v[0]},"y":${v[1]},"w":${v[2]},"h":${v[3]},"rev":${++projRev}}`);
   }
   syncShow();
 }
@@ -789,7 +792,7 @@ function syncShow() {
   }
   if (key === showKey || (key === 'off' && showKey === '')) return;
   showKey = key;
-  if (want) { const [w, h] = projSize(); send(`{"t":"show","on":true,"w":${w},"h":${h}}`); }
+  if (want) { const [w, h] = projSize(); send(`{"t":"show","on":true,"w":${w},"h":${h},"rev":${++projRev}}`); }
   else { send('{"t":"show","on":false}'); }
 }
 
@@ -822,12 +825,12 @@ showBtn.addEventListener('click', () => setShow(!showOn, true));
 
 // One binary frame: a 4-byte big-endian number, then the JPEG. Acknowledged once drawn (or dropped), always.
 function onFrameBytes(buf) {
-  if (!(buf instanceof ArrayBuffer) || buf.byteLength < 6) return;
-  const n = new DataView(buf).getUint32(0), blob = new Blob([new Uint8Array(buf, 4)], { type: 'image/jpeg' });
-  projChain = projChain.then(() => drawFrame(n, blob));
+  if (!(buf instanceof ArrayBuffer) || buf.byteLength < 8) return;
+  const dv = new DataView(buf), n = dv.getUint32(0), rev = dv.getUint16(4), blob = new Blob([new Uint8Array(buf, 6)], { type: 'image/jpeg' });
+  projChain = projChain.then(() => drawFrame(n, blob, rev));
 }
 
-async function drawFrame(n, blob) {
+async function drawFrame(n, blob, rev) {
   try {
     // The Pencil's own work comes first: while it is down the next picture waits its turn, and the ack waits with it,
     // so the Mac holds back (its two-frame limit) and the rate falls by itself; it returns to full the moment the Pencil lifts.
@@ -835,7 +838,10 @@ async function drawFrame(n, blob) {
       const wait = PROJ_PEN_MS - (performance.now() - projDrawnAt);
       if (wait > 0) await new Promise((r) => setTimeout(r, wait));
     }
-    if (showOn && mode === 'mouse' && !pageHidden()) {
+    // A picture made for a part of the window the iPad has since moved away from is not drawn: the marks are already where
+    // the new part puts them. (It is still acknowledged below, so the Mac goes on.) Fingers still moving the zoom are the
+    // exception: pictures keep arriving behind them, as they always did, and the last one that lands settles it.
+    if (showOn && mode === 'mouse' && !pageHidden() && (rev === (projRev & 0xffff) || zoomPtrs.size > 0)) {
       const bmp = await createImageBitmap(blob);
       if (showOn) {
         projCtx.drawImage(bmp, 0, 0, proj.width, proj.height);
@@ -1179,7 +1185,9 @@ function macLost() {
   syncClosed();
   if (pendingExport) { clearTimeout(pendingExport.timer); pendingExport = null; }
   if (pendingSave) { clearTimeout(pendingSave); pendingSave = 0; toast('Connection lost during the save'); }
-  if (annotSaving) { clearTimeout(annotSaving); annotSaving = 0; toast('Connection lost during the save'); }
+  annotReady = false;   // nothing is drawn, cleared or saved until the next hello has matched the marks up
+  if (annotSaving) { clearTimeout(annotSaving.timer); annotSaving = null; toast('Connection lost during the save'); }
+  annotUI();
 }
 
 // Paste: the Mac stores the image on its clipboard and answers with its id and pixel size; the page
@@ -1444,12 +1452,9 @@ function setMode(m) {
 function modeUI() {
   body.dataset.mode = mode;
   for (const b of modeBtns) b.setAttribute('aria-pressed', String(b.dataset.m === mode));
-  hintTitle.textContent = mode === 'board' ? 'Draw on the shared Board' : 'Draw with Apple Pencil';
-  hintText.textContent = mode === 'board'
-    ? 'Strokes appear in the Board window on the Mac. Fingers only tap buttons.'
-    : 'Touch lightly to aim, press to click. Fingers only tap buttons.';
   syncClosed();
   bUI();
+  hintUI();
   annotUI();
 }
 
@@ -1517,17 +1522,28 @@ try {
 // is sent. The marks are drawn here (over the projection) and on the Mac (a click-through overlay over the window, so
 // the room sees them), both by board-core.js, from the same ops. x, y are 0 to 1 of the window, so the marks stay right
 // under any zoom and when the window is resized. The page owns the marks; the Mac keeps a copy while connected or not.
+//
+// Every message carries `gen`, the number of the Mac's target choice the marks were drawn for (it rides each `target`).
+// A new number means another window: the marks go. After a connect nothing is drawn, cleared or saved until the page and
+// the Mac have agreed on what they hold (annotReady), so a stroke can never start on one side only.
 
 const ANNOT_COLOR = '#ff453a', ANNOT_SIZE = 0.0065;   // one strong red, a medium width (a fraction of the window's width)
 const marksCv = $('marks'), marksCtx = marksCv.getContext('2d');
 const annotBtn = $('annot'), annotSaveBtn = $('annot-save'), annotClearBtn = $('annot-clear');
 const marks = core ? createBoard() : null;
+const marksView = core ? core.createInkView() : null;   // finished marks are kept drawn; a repaint adds only what is new
 let annotOn = false;
+let annotGen = null;       // the target choice the marks belong to (null: not told yet)
+let annotReady = false;    // page and Mac agree on the marks (set after every hello)
 let annotLive = null;      // the open stroke's id while the Pencil is down
 let annotPending = [];     // points of the open stroke not yet sent
-let marksRaf = 0, annotSaving = 0;
+let annotLast = null;      // the last point of the open stroke, [x, y, p]
+let marksRaf = 0;
+let annotSaving = null;    // { rid, timer } of the save the page is waiting on
+let annotRid = 0;          // numbers saves, so a late answer can only be taken for the save it answers
 
 const annotWindow = () => !!marks && mode === 'mouse' && !!target && showKind(target) === 'window';
+const annotShown = () => !!marks && (annotOn || marks.items.length > 0);   // marks on show or about to be
 
 function annotUI() {
   if (!marks) return;
@@ -1536,14 +1552,44 @@ function annotUI() {
   annotBtn.classList.toggle('on', annotOn);
   annotBtn.setAttribute('aria-pressed', String(annotOn));
   annotSaveBtn.hidden = annotClearBtn.hidden = !(win && (annotOn || has));
+  annotSaveBtn.disabled = annotClearBtn.disabled = !annotReady;   // not while the Mac and this page are still matching up
   body.classList.toggle('annotating', annotOn && win);
+  body.classList.toggle('marked', annotShown());   // the picture then moves with the marks, not gliding behind them
+  hintUI();
+}
+
+// The first-use hint says what the Pencil does now.
+function hintUI() {
+  if (mode === 'board') {
+    hintTitle.textContent = 'Draw on the shared Board';
+    hintText.textContent = 'Strokes appear in the Board window on the Mac. Fingers only tap buttons.';
+  } else if (annotOn && annotWindow()) {
+    hintTitle.textContent = 'Mark up the window';
+    hintText.textContent = 'Draw to mark it in red; the cursor stays put. Tap Annotate again to click and scroll. Fingers only tap buttons.';
+  } else {
+    hintTitle.textContent = 'Draw with Apple Pencil';
+    hintText.textContent = 'Touch lightly to aim, press to click. Fingers only tap buttons.';
+  }
+}
+
+// Annotate's buttons can wrap the toolbar onto a second row: the drawing area starts below whatever height it has.
+let barH = 0;
+if (typeof ResizeObserver !== 'undefined') {
+  new ResizeObserver(() => { const h = bar.getBoundingClientRect().height; if (h !== barH) { barH = h; fit(); } }).observe(bar);
 }
 
 // The marks over the active area. The active area is the part of the window the iPad shows (the region), so the whole
-// window is 1 / region.w of its width, and the bitmap is offset to where the region begins.
+// window is 1 / region.w of its width, and the bitmap is offset to where the region begins. With no marks and Annotate
+// off there is no bitmap at all.
 function placeMarks() {
   if (!marks) return;
-  const dpr = Math.min(3, window.devicePixelRatio || 1), s = marksCv.style;
+  const s = marksCv.style;
+  if (mode !== 'mouse' || !annotShown()) {
+    s.width = s.height = '0px';
+    if (marksCv.width !== 0) { marksCv.width = marksCv.height = 0; marksView.release(); }   // sizing to zero lets the backing go
+    return;
+  }
+  const dpr = Math.min(3, window.devicePixelRatio || 1);
   s.left = area.x + 'px'; s.top = area.y + 'px'; s.width = area.w + 'px'; s.height = area.h + 'px';
   const w = Math.max(1, Math.round(area.w * dpr)), h = Math.max(1, Math.round(area.h * dpr));
   if (marksCv.width !== w || marksCv.height !== h) { marksCv.width = w; marksCv.height = h; }
@@ -1552,22 +1598,22 @@ function placeMarks() {
 
 function drawMarks() {
   const w = marksCv.width, h = marksCv.height;
-  marksCtx.setTransform(1, 0, 0, 1, 0, 0);
-  marksCtx.clearRect(0, 0, w, h);
-  if (mode !== 'mouse' || !marks.items.length) return;
+  if (!w || !h) return;
+  if (mode !== 'mouse') { marksCtx.clearRect(0, 0, w, h); return; }
   const W = w / region.w, H = h / region.h;   // the whole window, in bitmap pixels
-  marksCtx.setTransform(1, 0, 0, 1, -region.x * W, -region.y * H);
-  renderInk(marks, marksCtx, W, H);
+  marksView.draw(marks, marksCtx, w, h, W, H, region.x * W, region.y * H);
 }
 
 function marksWake() {
-  if (!marksRaf) marksRaf = requestAnimationFrame(() => { marksRaf = 0; drawMarks(); });
+  if (!marksRaf) marksRaf = requestAnimationFrame(() => { marksRaf = 0; if (annotShown() || marksCv.width) placeMarksIfNeeded(); });
 }
+// A mark was added or removed: the bitmap appears with the first one and goes with the last.
+function placeMarksIfNeeded() { if (!!marksCv.width !== (mode === 'mouse' && annotShown())) placeMarks(); else drawMarks(); }
 
 // One op: here, and to the Mac (begin, pts and end draw there; the Mac keeps them).
 function annotApply(o) {
   marks.apply(o);
-  if (ready) send(JSON.stringify({ t: 'annot', ...o }));
+  send(JSON.stringify({ t: 'annot', gen: annotGen, ...o }));
   marksWake();
   if (o.op !== 'pts') annotUI();
 }
@@ -1576,45 +1622,75 @@ function annotDown(e, x, y) {
   if (!body.classList.contains('drawn')) body.classList.add('drawn');
   annotPending = [];
   annotLive = marks.nextId();
-  annotApply({ op: 'begin', id: annotLive, tool: 'pen', color: ANNOT_COLOR, size: ANNOT_SIZE, pts: [[toTargetX(normX(x)), toTargetY(normY(y)), bPressure(e)]] });
+  const first = [toTargetX(normX(x)), toTargetY(normY(y)), bPressure(e)];
+  annotLast = first;
+  annotApply({ op: 'begin', id: annotLive, tool: 'pen', color: ANNOT_COLOR, size: ANNOT_SIZE, pts: [first] });
 }
+
+// A point is kept only if it moved. Marks are drawn here at once; the Mac hears them in batches (see annotFlush).
+function annotPoint(X, Y, p) {
+  if (annotLast && annotLast[0] === X && annotLast[1] === Y) return null;
+  annotLast = [X, Y, p];
+  return annotLast;
+}
+
+const ANNOT_BATCH_MS = 40;   // the Mac is sent the new points of a stroke at most this often
+let annotFlushTimer = 0;
 
 function annotMove(e) {
   const list = hasCoalesced ? e.getCoalescedEvents() : null;
+  const fresh = [];
   for (const ev of list && list.length ? list : [e]) {
-    const X = toTargetX(normX(ev.clientX)), Y = toTargetY(normY(ev.clientY)), n = annotPending.length;
-    if (n ? annotPending[n - 1][0] !== X || annotPending[n - 1][1] !== Y : true) annotPending.push([X, Y, bPressure(ev)]);
+    const pt = annotPoint(toTargetX(normX(ev.clientX)), toTargetY(normY(ev.clientY)), bPressure(ev));
+    if (pt) fresh.push(pt);
   }
-  annotFlush();
+  annotGrow(fresh);
 }
 
+function annotGrow(fresh) {
+  if (!fresh.length) return;
+  marks.apply({ op: 'pts', id: annotLive, pts: fresh });
+  annotPending.push(...fresh);
+  marksWake();
+  if (!annotFlushTimer) annotFlushTimer = setTimeout(annotFlush, ANNOT_BATCH_MS);
+}
+
+// Sends the points gathered since the last batch (already drawn here).
 function annotFlush() {
+  clearTimeout(annotFlushTimer); annotFlushTimer = 0;
   if (annotLive === null || !annotPending.length) return;
   const pts = annotPending;
   annotPending = [];
-  for (let i = 0; i < pts.length; i += PTS_CAP) annotApply({ op: 'pts', id: annotLive, pts: pts.slice(i, i + PTS_CAP) });
+  for (let i = 0; i < pts.length; i += PTS_CAP) send(JSON.stringify({ t: 'annot', gen: annotGen, op: 'pts', id: annotLive, pts: pts.slice(i, i + PTS_CAP) }));
 }
 
-// The Pencil lifted, or the page is letting go of it: finish the open stroke.
-function annotLift() {
+// The Pencil lifted, or the page is letting go of it: finish the open stroke. A genuine lift (it has a position) draws
+// to where the Pencil came off, when that is not where the last move was.
+function annotLift(e) {
   if (annotLive === null) return;
+  if (e && e.type === 'pointerup') {
+    const pt = annotPoint(toTargetX(normX(e.clientX)), toTargetY(normY(e.clientY)), annotLast ? annotLast[2] : 0.5);
+    if (pt) annotGrow([pt]);
+  }
   annotFlush();
   annotApply({ op: 'end', id: annotLive });
   annotLive = null;
+  annotLast = null;
 }
 
 function annotOff() {
   annotLift();
   annotOn = false;
   annotUI();
+  placeMarks();
 }
 
 // Every mark gone from this page. (The Mac is told by whoever calls this, or already knows.)
 function annotWipe() {
   annotLift();
   marks.apply({ op: 'reset' });
-  marksWake();
   annotUI();
+  placeMarks();
 }
 
 // Another window or a screen became the target: no marks, Annotate off.
@@ -1624,44 +1700,71 @@ function annotDrop() {
   annotWipe();
 }
 
+// The Mac says which target choice is current. A different one than the marks were made for takes them away.
+function annotAdopt(gen) {
+  if (!marks || typeof gen !== 'number' || gen === annotGen) return false;
+  const had = annotShown();
+  if (annotGen !== null) annotDrop();   // (an open stroke is ended under the number it began with)
+  annotGen = gen;
+  return had;
+}
+
 annotBtn.addEventListener('click', () => {
   if (annotOn) { annotOff(); return; }
-  if (!ready || !annotWindow()) return;
+  if (!ready || !annotReady || !annotWindow()) return;
   setRight(false);   // a right-click armed for the mouse must not wait behind the marks
   annotOn = true;
   annotUI();
+  placeMarks();
 });
 
 annotClearBtn.addEventListener('click', () => {
+  if (!annotReady) return;
   annotWipe();
-  send('{"t":"annot","op":"clear"}');
+  send(JSON.stringify({ t: 'annot', op: 'clear', gen: annotGen }));
 });
 
 annotSaveBtn.addEventListener('click', () => {
-  if (!ready) { toast('Not connected to the Mac'); return; }
+  if (!ready || !annotReady) { toast('Not connected to the Mac'); return; }
   if (annotSaving) return;   // one save at a time
   annotLift();
-  send('{"t":"annot","op":"save"}');
+  const rid = ++annotRid;
+  send(JSON.stringify({ t: 'annot', op: 'save', rid, gen: annotGen }));
   toast('Saving…', true);   // the done message replaces this
-  annotSaving = setTimeout(() => { annotSaving = 0; toast('The Mac did not confirm the save'); }, 60000);
+  annotSaving = { rid, timer: setTimeout(() => { annotSaving = null; toast('The Mac did not confirm the save'); }, 60000) };
 });
 
 function onAnnot(m) {
   if (!marks) return;
   if (m.op === 'done') {
-    if (annotSaving) { clearTimeout(annotSaving); annotSaving = 0; }
+    // An answer belongs to the save it names: a late one never settles a newer request.
+    const mine = annotSaving && annotSaving.rid === m.rid;
+    if (mine) { clearTimeout(annotSaving.timer); annotSaving = null; }
     toast(m.ok ? `Saved to Desktop: ${m.name || 'PencilPad Annotation.png'}` : (m.why || 'Save failed'));
   } else if (m.op === 'reset') {   // the Mac's target became another window or a screen
-    const had = annotOn || marks.items.length > 0;
-    annotDrop();
-    if (had) toast('Marks cleared: the target changed');
-  } else if (m.op === 'state') {   // sent after every hello: how many marks the Mac still holds
-    if (annotLive !== null) return;
-    const n = Number(m.n) || 0, mine = marks.items.length > 0;
-    if (!n && mine) { annotOff(); annotWipe(); toast('Marks cleared: the target changed'); return; }
-    if (n || mine) send('{"t":"annot","op":"clear"}');   // the Mac's copy is rebuilt from this page's
-    if (mine) for (const o of marks.toOps()) if (o.op !== 'bg') send(JSON.stringify({ t: 'annot', ...o }));
+    if (annotAdopt(m.gen)) toast('Marks cleared: the target changed');
+    else if (typeof m.gen !== 'number') annotDrop();
+  } else if (m.op === 'state') {   // sent after every hello: how many marks the Mac still holds, for which target choice
+    annotReconcile(Number(m.n) || 0, m.gen);
   }
+}
+
+// After a hello the page and the Mac match up before anything else is drawn. Same target choice: whichever side has marks
+// keeps them (both: the page's win, handed over as one staged replay the Mac swaps in only when all of it has arrived).
+// Another choice: the marks were for another window and are gone.
+function annotReconcile(n, gen) {
+  if (annotAdopt(gen)) toast('Marks cleared: the target changed');
+  const mine = marks.items.length;
+  if (mine) {
+    const ops = marks.toOps().filter((o) => o.op !== 'bg');
+    send(JSON.stringify({ t: 'annot', op: 'replay', gen: annotGen }));
+    for (const o of ops) send(JSON.stringify({ t: 'annot', gen: annotGen, replay: true, ...o }));
+    send(JSON.stringify({ t: 'annot', op: 'commit', gen: annotGen, n: mine }));
+  } else if (n) {
+    send(JSON.stringify({ t: 'annot', op: 'clear', gen: annotGen }));   // the page was reloaded and has none: the Mac's are not wanted
+  }
+  annotReady = true;
+  annotUI();
 }
 
 // ---------- Start ----------
