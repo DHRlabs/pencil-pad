@@ -683,6 +683,12 @@ function render(board, ctx, w, h) {
   for (const s of board.items) drawItem(ctx, w, h, s, board.bg);
 }
 
+// Only the live items over whatever is already on the canvas (no background, no images): Mouse mode's Annotate
+// layer, drawn the same way on the iPad and in the Mac's overlay window. The ink is drawn as on a dark board, so only black would change.
+function renderInk(board, ctx, w, h) {
+  for (const s of board.items) drawItem(ctx, w, h, s, 'ink');
+}
+
 // The same picture, cheaper, for a canvas that redraws as strokes arrive. Background, images and
 // finished strokes live in a cached layer that is rebuilt only when something already drawn changes
 // (undo, redo, erase, clear, background, reset, resize, an image added or finished loading); the
@@ -707,5 +713,33 @@ function createView() {
   };
 }
 
-globalThis.PencilBoardCore = { BGS, SHAPES, createBoard, createView, render, drawItem, drawStroke, drawBG, inkOn, fitNote };
+// Annotate's ink layer with the finished marks cached, so a repaint draws only what is new. The caller's canvas is `cw` x `ch`
+// and shows the part of the whole window (`W` x `H` pixels) that starts at (`ox`, `oy`); only the live items go on `ctx`.
+// The cache is rebuilt when the board was reset or changed under it, or the geometry differs; `release()` lets it go.
+function createInkView() {
+  let base = null, bctx = null, key = '', gen = -1, baked = 0;
+  return {
+    draw(board, ctx, cw, ch, W, H, ox, oy) {
+      const list = board.items;
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      ctx.clearRect(0, 0, cw, ch);
+      if (!list.length) return;
+      const k = `${cw}x${ch} ${W} ${H} ${ox} ${oy}`;
+      if (!base) { base = document.createElement('canvas'); bctx = base.getContext('2d'); key = ''; }
+      if (k !== key || gen !== board.gen) {
+        base.width = cw; base.height = ch;   // sizing clears it
+        key = k; gen = board.gen; baked = 0;
+      }
+      bctx.setTransform(1, 0, 0, 1, -ox, -oy);
+      while (baked < list.length && list[baked].ended) { drawItem(bctx, W, H, list[baked], 'ink'); baked++; }   // advances only once the item is drawn
+      ctx.drawImage(base, 0, 0);
+      ctx.setTransform(1, 0, 0, 1, -ox, -oy);
+      for (let i = baked; i < list.length; i++) drawItem(ctx, W, H, list[i], 'ink');
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+    },
+    release() { if (base) { base.width = base.height = 0; } base = bctx = null; key = ''; gen = -1; baked = 0; },
+  };
+}
+
+globalThis.PencilBoardCore = { BGS, SHAPES, createBoard, createView, createInkView, render, renderInk, drawItem, drawStroke, drawBG, inkOn, fitNote };
 })();

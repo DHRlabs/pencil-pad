@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>PencilPad Annotate</title>
+<link rel="icon" href="data:,">
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: transparent; }
+  canvas { position: fixed; inset: 0; width: 100%; height: 100%; display: block; pointer-events: none; }
+</style>
+</head>
+<body>
+<canvas id="ink"></canvas>
+<!-- Classic script on purpose, like board.html. -->
+<script src="board-core.js"></script>
+<script>
+// PencilPad Annotate overlay (Mac, WKWebView over the target window): a transparent page that shows the
+// Pencil's marks on the Mac, drawn by the same board-core.js the iPad uses. It is only handed the annot
+// ops (see AGENTS.md); x, y are 0 to 1 of the window, so the ink follows a moved or resized window.
+(() => {
+  const { createBoard, createInkView, renderInk } = PencilBoardCore;
+
+  const canvas = document.getElementById('ink');
+  const ctx = canvas.getContext('2d');
+  const board = createBoard();
+  const view = createInkView();
+  let timer = 0, lastDraw = 0;
+
+  // A paint that failed where nobody is waiting for an answer (a resize, a timer) is told to the Mac, which rebuilds the ink once
+  // from the marks it holds. Never swallowed: the canvas may already be empty. (No Mac to tell in the page Save makes for itself.)
+  function paintFailed(e) {
+    console.error('annot: paint failed', e);
+    try { window.webkit.messageHandlers.paint.postMessage(String((e && e.message) || e)); } catch (_) {}
+  }
+
+  // A timer, not requestAnimationFrame: WebKit pauses animation frames for a window it thinks is hidden or covered.
+  function schedule() {
+    if (timer) return;
+    timer = setTimeout(() => { timer = 0; try { draw(); } catch (e) { paintFailed(e); } }, Math.max(0, 12 - (performance.now() - lastDraw)));   // a resize or a reload of marks; ops from the Mac paint in applyAll
+  }
+
+  // Finished marks come from a cache; only the one being drawn is painted again.
+  function draw() {
+    lastDraw = performance.now();
+    if (!(canvas.width > 0 && canvas.height > 0)) return;
+    try {
+      view.draw(board, ctx, canvas.width, canvas.height, canvas.width, canvas.height, 0, 0);
+    } catch (e) {
+      view.release();   // whatever the cache holds may be half drawn: the next paint starts it over from the marks
+      throw e;
+    }
+  }
+
+  function resize() {
+    const dpr = Math.min(2, window.devicePixelRatio || 1);
+    canvas.width = Math.max(1, Math.round(window.innerWidth * dpr));
+    canvas.height = Math.max(1, Math.round(window.innerHeight * dpr));
+    try { draw(); } catch (e) { paintFailed(e); }
+  }
+
+  function one(msg) {
+    if (!msg || typeof msg !== 'object') return;
+    board.apply(msg.op === 'clear' ? { op: 'reset' } : msg);
+  }
+
+  // Empties `b` and makes it hold exactly these marks.
+  function fill(b, list) {
+    b.apply({ op: 'reset' });
+    for (const s of Array.isArray(list) ? list : []) {
+      const pts = [];
+      for (let i = 0; i + 2 < s.flat.length; i += 3) pts.push([s.flat[i], s.flat[i + 1], s.flat[i + 2]]);
+      b.apply({ op: 'begin', id: s.id, tool: 'pen', color: s.color, size: s.size, pts });
+      b.apply({ op: 'end', id: s.id });
+    }
+  }
+
+  function paint(b, w, h) {
+    const off = document.createElement('canvas');
+    off.width = w; off.height = h;
+    renderInk(b, off.getContext('2d'), w, h);
+    return off.toDataURL('image/png');
+  }
+
+  window.PencilAnnot = {
+    // A batch of annot ops (begin, pts, end, clear), in the order the Mac accepted them.
+    // The paint happens inside the call, so what it returns (or throws) is the real result of painting these ops: the Mac's
+    // recovery (one rebuild from its store) hears about a paint that failed.
+    applyAll(list) {
+      if (!Array.isArray(list)) return;
+      for (const m of list) one(m);
+      if (!board.items.length) view.release();
+      clearTimeout(timer); timer = 0;
+      draw();
+      return true;
+    },
+    // Marks given whole ({id, color, size, flat: [x, y, p, ...]}), in place of whatever is held (the page nobody sees, used by Save
+    // when no overlay exists, draws from this).
+    loadStrokes(list) {
+      fill(board, list);
+      schedule();
+    },
+    // The marks alone, transparent, as a PNG data URL w by h pixels (for Save, which lays them over the window's picture).
+    png(w, h) { return paint(board, w, h); },
+    // The same for marks given whole, on a board of their own: the live marks and the overlay are not touched, so Save can ask the
+    // overlay's own page and nothing else has to be made on the Mac for it.
+    pngOf(list, w, h) {
+      const own = createBoard();
+      fill(own, list);
+      return paint(own, w, h);
+    },
+    count: () => board.items.length,
+  };
+
+  window.addEventListener('resize', resize);
+  resize();
+})();
+</script>
+</body>
+</html>

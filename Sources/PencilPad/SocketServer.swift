@@ -14,6 +14,13 @@ final class Client {
     var boardReplayed = -1
     /// Input messages waiting, in order, for a fresh window frame before the first touch after a quiet spell (nil: none waiting).
     var held: [Data]?
+    /// The target choice whose marks this connection was last sent whole (nil: none yet).
+    var annotSynced: Int?
+    /// Version of the page's wire protocol, from its hello: 2 tags what it asks to see (`rev`) and expects tagged frames; a page whose
+    /// hello has no `v` (main's) gets main's frames and has its `rev` ignored.
+    var version = 1
+    /// This connection as the asker of window choices (see `ChoiceAsker`).
+    let asker = ChoiceAsker()
 
     init(id: Int, conn: NWConnection) {
         self.id = id
@@ -40,6 +47,13 @@ final class SocketServer {
     private lazy var board = makeBoard()
     /// Shows where the iPad is zoomed to.
     private lazy var outline = RegionOutline(targets: targets)
+    /// Mouse mode's Annotate: the marks over the window target.
+    private lazy var annotation: Annotation = {
+        let annotation = Annotation(targets: targets)
+        annotation.onTargetGone = { [weak self] in self?.targets.followWindow(force: true) }  // the app is asked; a window that is gone drops the target
+        annotation.onFrame = { [weak self] rect, window in self?.targets.adoptFrame(rect, of: window) }  // a resize the window server saw reaches Show and the page
+        return annotation
+    }()
     /// Streams the target area to the iPad while it asks for it.
     private lazy var projection = Projection(
         targets: targets, outline: outline,
@@ -75,7 +89,13 @@ final class SocketServer {
     init(targets: Targets, pen: Pen) {
         self.targets = targets
         self.pen = pen
-        targets.onChange = { [weak self] in self?.projection.retarget() }  // a moved or resized window, another target
+        targets.onChange = { [weak self] in  // a moved or resized window, another target
+            self?.projection.retarget()
+        }
+        targets.onChoice = { [weak self] in  // every choice, even one that picked the same bounds again: its marks and its picture start over
+            self?.annotation.targetChosen()
+            self?.projection.choose()
+        }
         targets.onFollowChange = { [weak self] in self?.pushTarget() }  // the window was resized, or went away
     }
 
@@ -120,7 +140,87 @@ final class SocketServer {
 
     func pushTarget() {
         guard let c = active else { return }
-        send(c, ["t": "target", "target": targets.current.json])
+        sendTarget(c)
+    }
+
+    /// The target, and right behind it, when a choice has been made since this connection last had its marks, the marks of that choice.
+    private func sendTarget(_ c: Client) {
+        send(c, ["t": "target", "target": targetJSON()])
+        if c.annotSynced != targets.generation { syncAnnot(c) }
+    }
+
+    /// The target as the page hears it: with the number of the choice that made it, which stamps every annot message.
+    private func targetJSON() -> [String: Any] {
+        var json = targets.current.json
+        json["gen"] = targets.generation
+        return json
+    }
+
+    // MARK: Annotate
+
+    /// One Annotate message of the page's body, stamped with the target choice it is about.
+    private func annotMessage(_ body: [String: Any], gen: Any) -> [String: Any] {
+        var msg = body
+        msg["t"] = "annot"
+        msg["gen"] = gen
+        return msg
+    }
+
+    /// The page is sent the Mac's marks for the current target choice, whole: a reset, every mark as begin, pts and end ops
+    /// (frames well under 60 KB), then one message naming the choice and the count. The page shows exactly that.
+    private func syncAnnot(_ c: Client) {
+        let gen = targets.generation
+        c.annotSynced = gen
+        send(c, annotMessage(["op": "reset"], gen: gen))
+        for op in annotation.syncOps() { send(c, annotMessage(op, gen: gen)) }
+        send(c, annotMessage(["op": "synced", "n": annotation.strokes], gen: gen))
+    }
+
+    /// begin, pts and end draw; clear empties; save writes the window's picture with the marks; on asks whether the window can
+    /// be marked. Every one carries `gen`, the target choice the page is showing; one for another choice is dropped before
+    /// anything looks at it. The marks are the Pencil in use, so they keep the window's frame fresh like a hover does.
+    private func handleAnnot(_ c: Client, _ msg: [String: Any]) {
+        let op = msg["op"] as? String
+        let gen = (msg["gen"] as? NSNumber).flatMap { Int(exactly: $0.doubleValue) }
+        guard gen == targets.generation else {
+            log.notice("client \(c.id): annot \(op ?? "", privacy: .public) is for another target choice; dropped")
+            switch op {
+            case "save":  // the page is waiting for its answer
+                send(c, ["t": "annot", "op": "done", "rid": msg["rid"] ?? NSNull(), "ok": false, "why": "The window changed before the save; nothing was saved", "gen": msg["gen"] ?? NSNull()])
+            case "begin", "pts", "end":
+                send(c, annotMessage(["op": "drop", "id": msg["id"] ?? NSNull(), "kind": "stale"], gen: msg["gen"] ?? NSNull()))
+            case "clear", "on":  // no stroke to name; the page hears that it was for another choice (and its next sync is on its way)
+                send(c, annotMessage(["op": "drop", "kind": "stale", "why": "That was for another window choice"], gen: msg["gen"] ?? NSNull()))
+            default:
+                break
+            }
+            return
+        }
+        switch op {
+        case "begin", "pts", "end":
+            lastContact = ProcessInfo.processInfo.systemUptime
+            if !pencilActive {
+                pencilActive = true
+                targets.followWindow(force: true)
+            }
+            if let reply = annotation.apply(msg) { send(c, annotMessage(reply, gen: targets.generation)) }
+        case "clear":
+            annotation.clear()
+            syncAnnot(c)
+        case "on":
+            if let why = annotation.refusal { send(c, annotMessage(["op": "refused", "why": why], gen: targets.generation)) }
+        case "save":
+            let rid = msg["rid"] ?? NSNull()
+            let (frozen, finish) = annotation.beginSave()  // the window, the choice and the marks are fixed here, before anything else is read
+            Task {
+                let (name, why) = await finish()
+                log.notice("annotate save: \(name ?? "failed: \(why ?? "")", privacy: .public)")
+                send(c, name.map { ["t": "annot", "op": "done", "rid": rid, "ok": true, "name": $0, "gen": frozen] }
+                    ?? ["t": "annot", "op": "done", "rid": rid, "ok": false, "why": why ?? "Save failed", "gen": frozen])
+            }
+        default:
+            log.debug("client \(c.id): unknown annot op \(op ?? "", privacy: .public)")
+        }
     }
 
     // MARK: Board
@@ -240,14 +340,14 @@ final class SocketServer {
         }
     }
 
-    /// Writes the PNG to the Desktop as "PencilPad Board <yyyy-MM-dd at HH.mm.ss>.png" in local time and
+    /// Writes the PNG to the Desktop as "PencilPad <kind> <yyyy-MM-dd at HH.mm.ss>.png" in local time and
     /// returns the file name. A name that is taken (two saves in one second) gets " 2", " 3" before the
     /// extension; the write itself refuses to overwrite, so concurrent saves cannot collide.
-    private nonisolated static func saveToDesktop(_ data: Data) throws -> String {
+    nonisolated static func saveToDesktop(_ data: Data, kind: String = "Board") throws -> String {
         let clock = DateFormatter()
         clock.locale = Locale(identifier: "en_US_POSIX")  // the format is part of the name, not the locale
         clock.dateFormat = "yyyy-MM-dd 'at' HH.mm.ss"
-        let stem = "PencilPad Board \(clock.string(from: Date()))"
+        let stem = "PencilPad \(kind) \(clock.string(from: Date()))"
         let desktop = FileManager.default.urls(for: .desktopDirectory, in: .userDomainMask)[0]
         var n = 1
         while true {
@@ -315,11 +415,13 @@ final class SocketServer {
         guard !c.ended else { return }
         c.ended = true
         clients[c.id] = nil
+        c.asker.leave()  // this client's picks still waiting on an app must not raise a window for nobody (the menu's are not touched)
         if active === c {
             active = nil
             pen.release(reason: "client \(c.id) \(reason)")
             outline.reset()
             projection.hide()
+            annotation.closeOpen()
         }
         log.notice("client \(c.id) closed: \(reason, privacy: .public)")
         let conn = c.conn
@@ -349,6 +451,7 @@ final class SocketServer {
             pencilActive = false
             if targets.current.id == "window" { log.notice("follow: Pencil quiet for \(Int(Self.quietAfter)) s; background window reads paused") }
         }
+        targets.publishDeferredFrame()  // a held button was released some other way (the silence watchdog, a lost lift)
         if pencilActive { targets.followWindow() }  // keeps a window target's frame fresh while the Pencil is in use
         let silent = now - c.lastFrame
         if silent >= Self.idleLimit {
@@ -373,6 +476,7 @@ final class SocketServer {
 
         guard c.authed else {
             if t == "hello", let token = msg["token"] as? String, token == Settings.token {
+                c.version = Self.integer(msg["v"], in: 0...2) == 2 ? 2 : 1
                 authenticate(c)
             } else {
                 deny(c, why: t == "hello" ? "wrong token" : "first frame was not hello")
@@ -430,6 +534,7 @@ final class SocketServer {
             if let at { pen.move(at, pressure: pressure, tilt: tilt) }
         case "up":
             if let at { pen.up(at) } else { pen.release(reason: "up without coordinates") }
+            targets.publishDeferredFrame()  // a resize seen while the button was held
         case "target":
             targets.followWindow(force: true)  // a fresh read is on its way; a resize is pushed when it lands
             // Every request is answered with the target, even when nothing changed, so the page stays in sync.
@@ -438,13 +543,13 @@ final class SocketServer {
                 if msg["pick"] != nil {
                     // A pick that is not a whole number cannot name a listed window: nothing changes.
                     if let n = num("pick").flatMap({ Int(exactly: $0) }) {
-                        targets.pick(window: n) { [weak self] _ in self?.replyTarget(c) }
+                        targets.pick(window: n, asker: c.asker) { [weak self] _ in self?.replyTarget(c) }
                     } else {
                         log.error("client \(c.id): window pick is not a whole number")
                         replyTarget(c)
                     }
                 } else {
-                    targets.selectFrontWindow { [weak self] _ in self?.replyTarget(c) }
+                    targets.selectFrontWindow(asker: c.asker) { [weak self] _ in self?.replyTarget(c) }
                 }
             } else {
                 if let id = msg["id"] as? String { targets.select(id) }
@@ -461,16 +566,18 @@ final class SocketServer {
             // The part of the target the iPad is zoomed to. Pencil coordinates already arrive mapped into it;
             // the Mac only draws it for a moment.
             if let rx = x, let ry = y, let rw = num("w"), let rh = num("h") {
+                guard let rev = pageRev(c, msg) else { return }
                 let w = min(max(rw, 0.01), 1), h = min(max(rh, 0.01), 1)
                 outline.set(CGRect(x: min(max(rx, 0), 1 - w), y: min(max(ry, 0), 1 - h), width: w, height: h))
-                projection.retarget()
+                projection.region(rev: rev)  // pictures of the old part are never sent under this rev
                 lastContact = ProcessInfo.processInfo.systemUptime  // the outline was just on show
             }
         case "show":
             // Project the target area onto the iPad as w x h pixel frames, or stop.
             if msg["on"] as? Bool == true {
                 if let w = num("w").flatMap({ Int(exactly: $0.rounded()) }), let h = num("h").flatMap({ Int(exactly: $0.rounded()) }) {
-                    projection.show(owner: c.id, w: w, h: h)
+                    guard let rev = pageRev(c, msg) else { return }
+                    projection.show(owner: c.id, w: w, h: h, rev: rev, tagged: c.version == 2)
                 }
             } else {
                 projection.hide()
@@ -485,11 +592,33 @@ final class SocketServer {
             handleBoard(c, msg)
         case "ink":
             forwardInk(msg)
+        case "annot":
+            handleAnnot(c, msg)
         case "hello":
             break
         default:
             log.debug("client \(c.id): unknown message \(t, privacy: .public)")
         }
+    }
+
+    /// A JSON number that is a whole number inside `range` (not a Boolean, a fraction, or out of range), else nil. Checked before any
+    /// conversion, so no value from the wire can trap.
+    nonisolated static func integer(_ any: Any?, in range: ClosedRange<Int>) -> Int? {
+        guard let n = any as? NSNumber, CFGetTypeID(n) == CFNumberGetTypeID() else { return nil }
+        let d = n.doubleValue
+        guard d.isFinite, d == d.rounded(), d >= Double(range.lowerBound), d <= Double(range.upperBound) else { return nil }
+        return Int(d)
+    }
+
+    /// The `rev` on a `show` or `region` from a v2 page, as the 16 bits that ride on frames (0 for main's page, whose `rev` is
+    /// ignored). A v2 page's message with no usable `rev` (not a whole number from 0 to 2^31) is ignored.
+    private func pageRev(_ c: Client, _ msg: [String: Any]) -> UInt16? {
+        guard c.version == 2 else { return 0 }
+        guard let rev = Self.integer(msg["rev"], in: 0...(1 << 31)) else {
+            log.notice("client \(c.id): \(msg["t"] as? String ?? "", privacy: .public) without a usable rev; ignored")
+            return nil
+        }
+        return UInt16(truncatingIfNeeded: rev)
     }
 
     /// The fresh frame is in (or the wait ran out): the touch that waited, and what came behind it, go through in order.
@@ -502,7 +631,7 @@ final class SocketServer {
 
     private func replyTarget(_ c: Client) {
         guard !c.ended else { return }
-        send(c, ["t": "target", "target": targets.current.json])
+        sendTarget(c)
     }
 
     private func authenticate(_ c: Client) {
@@ -513,8 +642,9 @@ final class SocketServer {
         c.lastFrame = ProcessInfo.processInfo.systemUptime
         active = c
         log.notice("hello accepted: client \(c.id)")
-        send(c, ["t": "hello", "screens": targets.screens.map(\.json), "target": targets.current.json])
+        send(c, ["t": "hello", "screens": targets.screens.map(\.json), "target": targetJSON()])
         reportBoard(to: c)  // the page never relies on a remembered window state
+        syncAnnot(c)  // the marks outlive a connection; the page is given them whole
     }
 
     private func deny(_ c: Client, why: String) {

@@ -28,6 +28,7 @@
   <canvas id="fx" aria-hidden="true"></canvas>
   <canvas id="proj" aria-hidden="true"></canvas>
   <canvas id="ink" aria-hidden="true"></canvas>
+  <canvas id="marks" aria-hidden="true"></canvas>
   <div id="surface" aria-label="Drawing surface"></div>
 
   <div id="area" aria-hidden="true">
@@ -71,6 +72,15 @@
       </button>
       <button type="button" class="tool" id="show" title="Show: the Mac's picture of this window or screen, on the iPad" aria-label="Show" aria-pressed="false">
         <svg viewBox="0 0 24 24"><path d="M2.5 12s3.6-6.5 9.5-6.5 9.5 6.5 9.5 6.5-3.6 6.5-9.5 6.5S2.5 12 2.5 12Z"/><circle cx="12" cy="12" r="2.8"/></svg>
+      </button>
+      <button type="button" class="tool" id="annot" title="Annotate: mark up the window with the Pencil (the cursor stays put)" aria-label="Annotate" aria-pressed="false" hidden>
+        <svg viewBox="0 0 24 24"><path d="m4 20 .8-3.2L16.6 5a1.8 1.8 0 0 1 2.6 0l-.2-.2a1.8 1.8 0 0 1 0 2.6L7.2 19.2 4 20Z"/><path d="m14.5 7 2.5 2.5"/></svg>
+      </button>
+      <button type="button" class="tool" id="annot-save" title="Save the window with your marks to the Mac Desktop" aria-label="Save annotation" hidden>
+        <svg viewBox="0 0 24 24"><path d="M12 4v10"/><path d="m8 10.5 4 4 4-4"/><path d="M5 19h14"/></svg>
+      </button>
+      <button type="button" class="tool" id="annot-clear" title="Clear your marks" aria-label="Clear annotation" hidden>
+        <svg viewBox="0 0 24 24"><path d="M4.5 7h15"/><path d="M9.5 7V4.5h5V7"/><path d="m6.5 7 .9 11.6a2 2 0 0 0 2 1.9h5.2a2 2 0 0 0 2-1.9L17.5 7"/><path d="M10 11v6M14 11v6"/></svg>
       </button>
       <button type="button" class="tool" id="zoom" title="Zoom: tap, then pinch or drag with your fingers. Hold to show the whole screen" aria-label="Zoom" aria-pressed="false">
         <svg viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6.3"/><path d="m15.2 15.2 5 5M10.5 7.6v5.8M7.6 10.5h5.8"/></svg>

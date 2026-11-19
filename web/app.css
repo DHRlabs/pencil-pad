@@ -95,6 +95,9 @@ body.drawn #hint { opacity: 0; }
 }
 body.projecting #proj { opacity: 1; }
 body.zooming #proj { transition: opacity .2s ease; }
+/* With marks up the picture does not glide to a new place on a rotation or a refit: the marks are redrawn there at once,
+   so both land together. */
+body.marked #proj { transition: opacity .2s ease; }
 body.projecting #hint { opacity: 0; }
 #bar #show.on {
   color: rgb(var(--accent)); background: rgb(var(--accent) / .14);
@@ -298,6 +301,17 @@ body.fs #fs .off { display: block; }
   #mouse-tools { gap: 1px; }
 }
 
+/* Mouse mode, narrower than about a 10 inch landscape (a portrait iPad): the tools wrap onto a second, centered row instead
+   of running into each other when Annotate's Save and Clear join them. Wider, the one row is exactly as it was. */
+@media (max-width: 1169px) {
+  body:not([data-mode="board"]) #bar {
+    left: 0; right: 0; margin-inline: auto; transform: none;
+    width: fit-content;
+    flex-wrap: wrap; justify-content: center; row-gap: 3px;
+  }
+  body:not([data-mode="board"]) #mouse-tools { flex-wrap: wrap; justify-content: center; row-gap: 2px; }
+}
+
 /* Wrong link or taken over elsewhere: the socket stops retrying until the person acts. */
 .overlay {
   position: fixed; inset: 0; z-index: 20;
@@ -387,6 +401,16 @@ body:not([data-mode="board"]) #board-tools { display: none; }
 #bar .sz .dot { fill: currentColor; stroke: none; }
 #bar button.active { color: rgb(var(--accent)); background: rgb(var(--accent) / .13); box-shadow: inset 0 0 0 1px rgb(var(--accent) / .4); }
 #bar button:disabled { opacity: .35; pointer-events: none; }
+
+/* Annotate (Mouse mode, window target): the marks sit over the picture, exactly on the active area. They snap with the
+   area instead of gliding: they are redrawn for the new region at once. */
+#marks { position: fixed; left: 0; top: 0; width: 0; height: 0; pointer-events: none; border-radius: 4px; }
+body[data-mode="board"] #marks { display: none; }
+#bar #annot.on {
+  color: #ff453a; background: rgb(255 69 58 / .14);
+  box-shadow: inset 0 0 0 1px rgb(255 69 58 / .5), 0 0 16px rgb(255 69 58 / .25);
+}
+body.annotating .corner { border-color: #ff453a; filter: drop-shadow(0 0 7px #ff453a); }
 
 /* Board window closed on the Mac: a small tappable reminder over the board. */
 #breopen {
