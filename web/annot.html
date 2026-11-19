@@ -26,10 +26,17 @@
   const view = createInkView();
   let timer = 0, lastDraw = 0;
 
+  // A paint that failed where nobody is waiting for an answer (a resize, a timer) is told to the Mac, which rebuilds the ink once
+  // from the marks it holds. Never swallowed: the canvas may already be empty. (No Mac to tell in the page Save makes for itself.)
+  function paintFailed(e) {
+    console.error('annot: paint failed', e);
+    try { window.webkit.messageHandlers.paint.postMessage(String((e && e.message) || e)); } catch (_) {}
+  }
+
   // A timer, not requestAnimationFrame: WebKit pauses animation frames for a window it thinks is hidden or covered.
   function schedule() {
     if (timer) return;
-    timer = setTimeout(() => { timer = 0; try { draw(); } catch (_) {} }, Math.max(0, 12 - (performance.now() - lastDraw)));   // a resize or a reload of marks; ops from the Mac paint in applyAll
+    timer = setTimeout(() => { timer = 0; try { draw(); } catch (e) { paintFailed(e); } }, Math.max(0, 12 - (performance.now() - lastDraw)));   // a resize or a reload of marks; ops from the Mac paint in applyAll
   }
 
   // Finished marks come from a cache; only the one being drawn is painted again.
@@ -48,7 +55,7 @@
     const dpr = Math.min(2, window.devicePixelRatio || 1);
     canvas.width = Math.max(1, Math.round(window.innerWidth * dpr));
     canvas.height = Math.max(1, Math.round(window.innerHeight * dpr));
-    try { draw(); } catch (_) {}
+    try { draw(); } catch (e) { paintFailed(e); }
   }
 
   function one(msg) {

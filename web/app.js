@@ -490,7 +490,7 @@ function setTarget(t) {
   // belong to what was there before and go, and nothing is drawn until the Mac has sent this choice's marks.
   const newChoice = typeof t.gen === 'number' && t.gen !== (target && target.gen);
   const hadMarks = !!marks && marks.items.length > 0;
-  if (newChoice) { annotDrop(); annotReady = false; clearProj(); bumpRev(); showKey = ''; }   // the picture of what was there goes at once and is asked for again (fit below)
+  if (newChoice) { annotDrop(); annotReady = false; clearProj(); bumpRev(); if (showKey !== '' && showKey !== 'off') showKey = 'stale'; }   // the picture of what was there goes at once and is asked for again (fit below); a stream the Mac holds stays known, so a Show-off target still stops it
   target = t;
   if (t.w > 0 && t.h > 0) store.set('aspect', String(t.w / t.h));
   if (changed) { loadRegion(t); regionSent = ''; }   // that target's own zoom, and the Mac hears it once

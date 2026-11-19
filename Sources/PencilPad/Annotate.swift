@@ -12,6 +12,13 @@ private final class AnnotPanel: NSPanel {
     override func constrainFrameRect(_ frameRect: NSRect, to screen: NSScreen?) -> NSRect { frameRect }
 }
 
+/// Hears the overlay page's `paint` messages without the web view's configuration keeping the Annotation alive.
+@MainActor
+private final class PaintReports: NSObject, WKScriptMessageHandler {
+    weak var owner: Annotation?
+    func userContentController(_ controller: WKUserContentController, didReceive message: WKScriptMessage) { owner?.paintFailed() }
+}
+
 /// A finished image carried to a detached task.
 private struct ImageBox: @unchecked Sendable { let image: CGImage }
 
@@ -72,9 +79,9 @@ private struct MarkStore: Sendable {
         switch op {
         case "begin":
             if marks[id] != nil { return .refused(id: id, .duplicate) }
-            if order.count >= Self.maxMarks || points >= Self.maxPoints { return .refused(id: id, .cap) }
             let all = Self.points(msg["pts"], firstMustDraw: true)
-            guard !all.isEmpty else { return .refused(id: id, .noPoint) }
+            guard !all.isEmpty else { return .refused(id: id, .noPoint) }  // before the caps: a malformed first point is `invalid` even when full
+            if order.count >= Self.maxMarks || points >= Self.maxPoints { return .refused(id: id, .cap) }
             let room = Self.maxPoints - points, have = all.count / 3
             let kept = have > room ? Array(all.prefix(room * 3)) : all
             let color = Self.color(msg["color"])
@@ -455,6 +462,9 @@ final class Annotation: NSObject {
         panel.collectionBehavior = [.transient, .fullScreenAuxiliary, .ignoresCycle]
 
         let config = WKWebViewConfiguration()
+        let reports = PaintReports()
+        reports.owner = self
+        config.userContentController.add(reports, name: "paint")
         if let root = HTTPServer.webRoot() {
             config.setURLSchemeHandler(BoardPages(root: root), forURLScheme: BoardPages.scheme)
         } else {
@@ -485,6 +495,7 @@ final class Annotation: NSObject {
         panel?.orderOut(nil)
         webView?.stopLoading()
         webView?.navigationDelegate = nil
+        webView?.configuration.userContentController.removeScriptMessageHandler(forName: "paint")
         panel?.contentView = nil
         webView = nil
         panel = nil
@@ -523,6 +534,17 @@ final class Annotation: NSObject {
         loaded = true
         failures = 0
         rebuild = true
+        Task { await drain() }
+    }
+
+    /// The overlay page could not paint on its own (a resize, a timer): what it shows may be missing ink, so it is rebuilt once from
+    /// the store, the same recovery a failed batch gets.
+    fileprivate func paintFailed() {
+        guard loaded, webView != nil else { return }
+        failures += 1
+        log.error("annotate: overlay page reported a failed paint; rebuilding")
+        rebuild = true
+        pending = []
         Task { await drain() }
     }
 
@@ -575,14 +597,15 @@ final class Annotation: NSObject {
 
     private enum SaveError: Error { case encode }
 
-    /// Fixes, now, what a save is of: the window (its server number), and a value copy of the marks. Whatever changes after
-    /// this changes nothing in the file. The returned closure does the rest (capture, drawing, compositing, the write) and
-    /// answers with the file name, or a plain reason.
-    func beginSave() -> () async -> (name: String?, why: String?) {
-        guard targets.current.id == "window", let pid = targets.windowPID else { return { (nil, "No window is the target") } }
-        guard let windowID = targets.windowID else { return { (nil, "That window can't be told apart from the others on this Mac, so it was not saved") } }
+    /// Fixes, now, what a save is of: the window (its server number), the target choice (`gen`) and a value copy of the marks.
+    /// Whatever changes after this changes nothing in the file. The returned closure does the rest (capture, drawing,
+    /// compositing, the write) and answers with the file name, or a plain reason; the frozen `gen` is what the reply is stamped with.
+    func beginSave() -> (gen: Int, run: () async -> (name: String?, why: String?)) {
+        let gen = targets.generation
+        guard targets.current.id == "window", let pid = targets.windowPID else { return (gen, { (nil, "No window is the target") }) }
+        guard let windowID = targets.windowID else { return (gen, { (nil, "That window can't be told apart from the others on this Mac, so it was not saved") }) }
         let marks = store
-        return { [self] in await write(windowID: windowID, pid: pid, marks: marks) }
+        return (gen, { [self] in await write(windowID: windowID, pid: pid, marks: marks) })
     }
 
     /// Captures window `windowID` by itself with ScreenCaptureKit (a covered window saves right, no cursor, no shadow, a window

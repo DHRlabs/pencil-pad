@@ -19,6 +19,8 @@ final class Client {
     /// Version of the page's wire protocol, from its hello: 2 tags what it asks to see (`rev`) and expects tagged frames; a page whose
     /// hello has no `v` (main's) gets main's frames and has its `rev` ignored.
     var version = 1
+    /// This connection as the asker of window choices (see `ChoiceAsker`).
+    let asker = ChoiceAsker()
 
     init(id: Int, conn: NWConnection) {
         self.id = id
@@ -184,7 +186,7 @@ final class SocketServer {
             log.notice("client \(c.id): annot \(op ?? "", privacy: .public) is for another target choice; dropped")
             switch op {
             case "save":  // the page is waiting for its answer
-                send(c, ["t": "annot", "op": "done", "rid": msg["rid"] ?? NSNull(), "ok": false, "why": "The window changed before the save; nothing was saved"])
+                send(c, ["t": "annot", "op": "done", "rid": msg["rid"] ?? NSNull(), "ok": false, "why": "The window changed before the save; nothing was saved", "gen": msg["gen"] ?? NSNull()])
             case "begin", "pts", "end":
                 send(c, annotMessage(["op": "drop", "id": msg["id"] ?? NSNull(), "kind": "stale"], gen: msg["gen"] ?? NSNull()))
             case "clear", "on":  // no stroke to name; the page hears that it was for another choice (and its next sync is on its way)
@@ -209,12 +211,12 @@ final class SocketServer {
             if let why = annotation.refusal { send(c, annotMessage(["op": "refused", "why": why], gen: targets.generation)) }
         case "save":
             let rid = msg["rid"] ?? NSNull()
-            let finish = annotation.beginSave()  // the window and the marks are fixed here, before anything else is read
+            let (frozen, finish) = annotation.beginSave()  // the window, the choice and the marks are fixed here, before anything else is read
             Task {
                 let (name, why) = await finish()
                 log.notice("annotate save: \(name ?? "failed: \(why ?? "")", privacy: .public)")
-                send(c, name.map { ["t": "annot", "op": "done", "rid": rid, "ok": true, "name": $0] }
-                    ?? ["t": "annot", "op": "done", "rid": rid, "ok": false, "why": why ?? "Save failed"])
+                send(c, name.map { ["t": "annot", "op": "done", "rid": rid, "ok": true, "name": $0, "gen": frozen] }
+                    ?? ["t": "annot", "op": "done", "rid": rid, "ok": false, "why": why ?? "Save failed", "gen": frozen])
             }
         default:
             log.debug("client \(c.id): unknown annot op \(op ?? "", privacy: .public)")
@@ -413,9 +415,9 @@ final class SocketServer {
         guard !c.ended else { return }
         c.ended = true
         clients[c.id] = nil
+        c.asker.leave()  // this client's picks still waiting on an app must not raise a window for nobody (the menu's are not touched)
         if active === c {
             active = nil
-            targets.cancelChoices()  // a pick still waiting on an app must not raise its window for nobody
             pen.release(reason: "client \(c.id) \(reason)")
             outline.reset()
             projection.hide()
@@ -541,13 +543,13 @@ final class SocketServer {
                 if msg["pick"] != nil {
                     // A pick that is not a whole number cannot name a listed window: nothing changes.
                     if let n = num("pick").flatMap({ Int(exactly: $0) }) {
-                        targets.pick(window: n, owner: { [weak self] in self?.active === c }) { [weak self] _ in self?.replyTarget(c) }
+                        targets.pick(window: n, asker: c.asker) { [weak self] _ in self?.replyTarget(c) }
                     } else {
                         log.error("client \(c.id): window pick is not a whole number")
                         replyTarget(c)
                     }
                 } else {
-                    targets.selectFrontWindow(owner: { [weak self] in self?.active === c }) { [weak self] _ in self?.replyTarget(c) }
+                    targets.selectFrontWindow(asker: c.asker) { [weak self] _ in self?.replyTarget(c) }
                 }
             } else {
                 if let id = msg["id"] as? String { targets.select(id) }
