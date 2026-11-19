@@ -9,7 +9,9 @@ import VideoToolbox
 /// A captured frame travelling between queues.
 private final class PixelBox: @unchecked Sendable {
     let buffer: CVPixelBuffer
-    init(_ buffer: CVPixelBuffer) { self.buffer = buffer }
+    /// The numbering (see `Projection.restart`) it was captured under.
+    let tag: Int
+    init(_ buffer: CVPixelBuffer, tag: Int) { self.buffer = buffer; self.tag = tag }
 }
 
 /// Keeps at most two frames in flight (encoding or sent and not yet acknowledged). While both slots are taken the
@@ -22,6 +24,11 @@ private final class FrameFlow: @unchecked Sendable {
     private var pending: PixelBox?
     private var dropped = 0
     private var peak = 0
+
+    /// The numbering starts over: nothing in flight or waiting counts any more.
+    func restart() {
+        lock.lock(); inFlight = 0; sent = []; pending = nil; lock.unlock()
+    }
 
     /// Frames that had to wait and were replaced, and the most ever in flight, read under the lock.
     func counters() -> (dropped: Int, peak: Int) { lock.lock(); defer { lock.unlock() }; return (dropped, peak) }
@@ -75,20 +82,20 @@ private final class JPEGEncoder: @unchecked Sendable {
     private func setPath(_ name: String) { nameLock.lock(); pathName = name; nameLock.unlock() }
     private var counter: Int64 = 0
     /// Encoded bytes and how long the encode took, in milliseconds. Called on any thread.
-    private let finish: @Sendable (Data?, Double) -> Void
+    private let finish: @Sendable (Data?, Double, Int) -> Void
 
-    init(finish: @escaping @Sendable (Data?, Double) -> Void) { self.finish = finish }
+    init(finish: @escaping @Sendable (Data?, Double, Int) -> Void) { self.finish = finish }
 
     deinit { drop() }
 
-    func encode(_ pb: CVPixelBuffer) {
+    func encode(_ pb: CVPixelBuffer, tag: Int) {
         let w = CVPixelBufferGetWidth(pb), h = CVPixelBufferGetHeight(pb)
         if !useImageIO, session == nil || size != (w, h) { makeSession(w, h) }
         let started = DispatchTime.now().uptimeNanoseconds
         let finish = self.finish
         let ms: @Sendable () -> Double = { Double(DispatchTime.now().uptimeNanoseconds - started) / 1e6 }
         guard let session, !useImageIO else {
-            finish(Self.imageIO(pb), ms())
+            finish(Self.imageIO(pb), ms(), tag)
             return
         }
         counter += 1
@@ -96,17 +103,17 @@ private final class JPEGEncoder: @unchecked Sendable {
             session, imageBuffer: pb, presentationTimeStamp: CMTime(value: counter, timescale: 1000), duration: .invalid,
             frameProperties: nil, infoFlagsOut: nil
         ) { status, _, sample in
-            guard status == noErr, let sample, let block = CMSampleBufferGetDataBuffer(sample) else { finish(nil, ms()); return }
+            guard status == noErr, let sample, let block = CMSampleBufferGetDataBuffer(sample) else { finish(nil, ms(), tag); return }
             var length = 0
             var pointer: UnsafeMutablePointer<Int8>?
             guard CMBlockBufferGetDataPointer(block, atOffset: 0, lengthAtOffsetOut: nil, totalLengthOut: &length, dataPointerOut: &pointer) == noErr,
-                  let pointer else { finish(nil, ms()); return }
-            finish(Data(bytes: pointer, count: length), ms())
+                  let pointer else { finish(nil, ms(), tag); return }
+            finish(Data(bytes: pointer, count: length), ms(), tag)
         }
         if status != noErr {
             log.error("projection: JPEG encode failed (OSStatus \(status)); falling back to ImageIO")
             drop(); useImageIO = true; setPath("ImageIO")
-            finish(Self.imageIO(pb), ms())
+            finish(Self.imageIO(pb), ms(), tag)
         }
     }
 
@@ -164,17 +171,26 @@ private final class FrameSink: NSObject, SCStreamOutput, SCStreamDelegate, @unch
     private let lock = NSLock()
     private var closed = false
     private var encoder: JPEGEncoder!
-    private let onFrame: @Sendable (Data) -> Void
+    private let onFrame: @Sendable (Data, Int) -> Void
     private let onStopped: @Sendable (String) -> Void
+    /// The numbering new captures are made under (see `Projection.restart`); a frame that finishes under another is dropped.
+    private var tag = 0
     private var frames = 0, bytes = 0, encodeMs = 0.0, captured = 0
     private var windowStart = DispatchTime.now().uptimeNanoseconds
 
-    init(onFrame: @escaping @Sendable (Data) -> Void, onStopped: @escaping @Sendable (String) -> Void) {
+    init(onFrame: @escaping @Sendable (Data, Int) -> Void, onStopped: @escaping @Sendable (String) -> Void) {
         self.onFrame = onFrame
         self.onStopped = onStopped
         super.init()
-        encoder = JPEGEncoder { [weak self] data, ms in self?.encoded(data, ms) }
+        encoder = JPEGEncoder { [weak self] data, ms, tag in self?.encoded(data, ms, tag) }
     }
+
+    /// The numbering starts over under `tag`: what was captured, queued or encoding before is never sent.
+    func restart(tag: Int) {
+        lock.lock(); self.tag = tag; lock.unlock()
+        flow.restart()
+    }
+    private var currentTag: Int { lock.lock(); defer { lock.unlock() }; return tag }
 
     func close() { lock.lock(); closed = true; lock.unlock() }
     private var isClosed: Bool { lock.lock(); defer { lock.unlock() }; return closed }
@@ -185,8 +201,8 @@ private final class FrameSink: NSObject, SCStreamOutput, SCStreamDelegate, @unch
               let raw = attachments.first?[.status] as? Int, SCFrameStatus(rawValue: raw) == .complete,
               let pixels = CMSampleBufferGetImageBuffer(sampleBuffer)
         else { return }
-        lock.lock(); captured += 1; lock.unlock()
-        if let box = flow.offer(PixelBox(pixels)) { encoder.encode(box.buffer) }
+        lock.lock(); captured += 1; let tag = self.tag; lock.unlock()
+        if let box = flow.offer(PixelBox(pixels, tag: tag)) { encoder.encode(box.buffer, tag: box.tag) }
     }
 
     func stream(_ stream: SCStream, didStopWithError error: Error) {
@@ -196,16 +212,17 @@ private final class FrameSink: NSObject, SCStreamOutput, SCStreamDelegate, @unch
     /// The main actor numbered and sent a frame; the page drew `n`.
     func sent(_ n: UInt32) { flow.markSent(n) }
     func acked(_ n: UInt32) {
-        if let next = flow.ack(n) { queue.async { [self] in if !isClosed { encoder.encode(next.buffer) } } }
+        if let next = flow.ack(n) { queue.async { [self] in if !isClosed { encoder.encode(next.buffer, tag: next.tag) } } }
     }
 
-    private func encoded(_ data: Data?, _ ms: Double) {
+    private func encoded(_ data: Data?, _ ms: Double, _ tag: Int) {
+        guard tag == currentTag else { return }  // made under a numbering that has been dropped
         guard let data, !isClosed else {
-            if let next = flow.release() { queue.async { [self] in if !isClosed { encoder.encode(next.buffer) } } }
+            if let next = flow.release() { queue.async { [self] in if !isClosed { encoder.encode(next.buffer, tag: next.tag) } } }
             return
         }
         report(data.count, ms)
-        onFrame(data)
+        onFrame(data, tag)
     }
 
     private func report(_ size: Int, _ ms: Double) {
@@ -248,10 +265,10 @@ final class Projection {
     private var restarts = 0
     /// Counts streams, so a frame or a stop that arrives late from an earlier one is ignored.
     private var generation = 0
-    /// The newest revision the page stamped on a `show` or `region` (16 bits), and the one the running stream has been set to.
-    /// Each frame carries the applied one, so the page can tell a picture of the part it zoomed away from and not draw it.
-    private var requestedRev: UInt16 = 0
-    private var appliedRev: UInt16 = 0
+    /// The numbering the running stream is sending under: it moves on every window choice and region change (see `restart`).
+    private var epoch = 0
+    /// Moves on every show request, stop and window choice, so a lookup that finishes after a newer one can tell and is dropped.
+    private var request = 0
 
     init(targets: Targets, outline: RegionOutline, reply: @escaping (Int, Bool, String?) -> Void, sendFrame: @escaping (Int, Data) -> Void) {
         self.targets = targets
@@ -261,10 +278,10 @@ final class Projection {
     }
 
     /// `show` on: start, or re-fit a running stream to a new size.
-    func show(owner: Int, w: Int, h: Int, rev: UInt16) {
+    func show(owner: Int, w: Int, h: Int) {
         if self.owner != owner { retireStream() }  // another page's frames never carry over
         self.owner = owner
-        requestedRev = rev
+        request += 1
         want = (min(max(w, 64), 8192), min(max(h, 64), 8192))
         // Screen Recording: ask once. After that the answer can stay "no" until PencilPad is relaunched, so the
         // stream is simply tried and ScreenCaptureKit's own refusal is what gets reported.
@@ -281,14 +298,26 @@ final class Projection {
     func hide() {
         want = nil
         owner = nil
+        request += 1
         retireStream()
         reconcileSoon(delay: 0)
     }
 
-    /// The target, its size, or the zoomed region changed. `rev` is the page's stamp on a region change.
-    func retarget(rev: UInt16? = nil) {
-        if let rev { requestedRev = rev }
+    /// The target, its size, or the zoomed region changed.
+    func retarget() {
         if want != nil { reconcileSoon() }
+    }
+
+    /// A window choice or a region change: frame numbering starts over at 1, and nothing captured, queued or encoding under the
+    /// old numbering is sent after this. The page clears its picture (a choice) or waits for frame 1 (a region), so it never draws
+    /// the old area behind the new one's marks. A choice also supersedes any window lookup still out.
+    func restart(choice: Bool = false) {
+        if choice { request += 1; retireStream() }  // the old stream sends nothing more; a new one is made, so even a still window sends its first frame
+        epoch += 1
+        nextFrame = 1
+        announced = false
+        sink?.restart(tag: epoch)
+        retarget()
     }
 
     func ack(_ n: UInt32) { sink?.acked(n) }
@@ -339,8 +368,9 @@ final class Projection {
 
     private func reconcileOnce() async {
         guard let want else { await stopStream(); return }
-        let rev = requestedRev
+        let mine = request
         let target = targets.current, region = outline.region ?? CGRect(x: 0, y: 0, width: 1, height: 1)
+        let pid = targets.windowPID, windowID = targets.windowID
         let identity = target.id == "window" ? "window #\(targets.windowSerial) pid \(targets.windowPID ?? 0) id \(targets.windowID ?? 0)" : "display \(target.id)"
         do {
             let (config, key) = Self.configuration(base: target.rect.size, region: region, want: want)
@@ -351,14 +381,14 @@ final class Projection {
                     applied = key
                     log.notice("projection: reconfigured \(identity, privacy: .public) \(key, privacy: .public)")
                 }
-                appliedRev = rev
                 return
             }
             log.notice("projection: looking up capturable windows and screens")
             let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: target.id != "window")
+            guard mine == request else { return }  // a newer show or choice came in while this looked: its answer is the one that counts
             let filter: SCContentFilter
             if target.id == "window" {
-                guard let pid = targets.windowPID, let window = Self.match(content.windows, id: targets.windowID, pid: pid, rect: target.rect) else {
+                guard let pid, let window = Self.match(content.windows, id: windowID, pid: pid, rect: target.rect) else {
                     fail("That window can't be shown right now"); return
                 }
                 filter = SCContentFilter(desktopIndependentWindow: window)
@@ -372,8 +402,8 @@ final class Projection {
             }
             await stopStream()
             try await startStream(filter: filter, config: config, identity: identity, key: key, what: target.name)
-            appliedRev = rev
         } catch {
+            guard mine == request else { return }
             if Self.isPermissionRefusal(error) {
                 log.error("projection: Screen Recording is not allowed for PencilPad")
                 fail("Allow PencilPad under Screen Recording in System Settings, then quit and reopen PencilPad")
@@ -394,12 +424,14 @@ final class Projection {
         generation += 1
         let mine = generation
         let sink = FrameSink(
-            onFrame: { [weak self] data in DispatchQueue.main.async { MainActor.assumeIsolated { self?.deliver(data, from: mine) } } },
+            onFrame: { [weak self] data, tag in DispatchQueue.main.async { MainActor.assumeIsolated { self?.deliver(data, tag: tag, from: mine) } } },
             onStopped: { [weak self] why in DispatchQueue.main.async { MainActor.assumeIsolated { self?.streamStopped(why, from: mine) } } })
         let stream = SCStream(filter: filter, configuration: config, delegate: sink)
         try stream.addStreamOutput(sink, type: .screen, sampleHandlerQueue: sink.queue)
         announced = false
         nextFrame = 1
+        epoch += 1
+        sink.restart(tag: epoch)
         // Set before starting: the first frames can reach the main queue before startCapture returns.
         self.sink = sink
         self.stream = stream
@@ -436,15 +468,14 @@ final class Projection {
     }
 
     /// A frame is encoded: number it and send it. The first one also tells the page the stream is up.
-    private func deliver(_ data: Data, from mine: Int) {
-        guard mine == generation, let owner, let sink, stream != nil else { return }
+    private func deliver(_ data: Data, tag: Int, from mine: Int) {
+        guard mine == generation, tag == epoch, let owner, let sink, stream != nil else { return }
         if !announced { announced = true; reply(owner, true, nil) }
         let n = nextFrame
         nextFrame &+= 1
         sink.sent(n)
-        var frame = Data(capacity: data.count + 6)
-        frame.append(contentsOf: [UInt8(n >> 24 & 0xff), UInt8(n >> 16 & 0xff), UInt8(n >> 8 & 0xff), UInt8(n & 0xff),
-                                  UInt8(appliedRev >> 8), UInt8(appliedRev & 0xff)])
+        var frame = Data(capacity: data.count + 4)
+        frame.append(contentsOf: [UInt8(n >> 24 & 0xff), UInt8(n >> 16 & 0xff), UInt8(n >> 8 & 0xff), UInt8(n & 0xff)])
         frame.append(data)
         sendFrame(owner, frame)
     }
@@ -463,21 +494,22 @@ final class Projection {
     /// Stops, remembers nothing, and tells the page why.
     private func fail(_ why: String) {
         want = nil
+        request += 1
         if let owner { reply(owner, false, why) }
         owner = nil
         retireStream()
         reconcileSoon(delay: 0)
     }
 
-    /// The SCWindow that is the target: the one with the window server's number the pick recorded. Only when that number could
-    /// not be read does it fall back to the same app's window at the frame the Accessibility API reported, and then only if
-    /// exactly one window qualifies: two alike are ambiguous and match nothing.
-    static func match(_ windows: [SCWindow], id: CGWindowID?, pid: pid_t, rect: CGRect) -> SCWindow? {
+    /// The SCWindow that is the target: the one with the window server's number the pick recorded, else (when that number
+    /// could not be read) the same app's window nearest the frame the Accessibility API reported.
+    private static func match(_ windows: [SCWindow], id: CGWindowID?, pid: pid_t, rect: CGRect) -> SCWindow? {
         if let id { return windows.first { $0.windowID == id && $0.owningApplication?.processID == pid } }
         func gap(_ w: SCWindow) -> CGFloat {
             abs(w.frame.minX - rect.minX) + abs(w.frame.minY - rect.minY) + abs(w.frame.width - rect.width) + abs(w.frame.height - rect.height)
         }
-        let near = windows.filter { $0.owningApplication?.processID == pid && $0.windowLayer == 0 && gap($0) < 12 }
-        return near.count == 1 ? near[0] : nil
+        return windows.filter { $0.owningApplication?.processID == pid && $0.windowLayer == 0 }
+            .min { gap($0) < gap($1) }
+            .flatMap { gap($0) < 12 ? $0 : nil }
     }
 }

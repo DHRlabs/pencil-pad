@@ -15,10 +15,13 @@ private final class AnnotPanel: NSPanel {
 /// A finished image carried to a detached task.
 private struct ImageBox: @unchecked Sendable { let image: CGImage }
 
+/// Plain JSON values (numbers, strings, arrays) carried between actors.
+private struct JSONBox: @unchecked Sendable { let value: [[String: Any]] }
+
 /// The marks themselves, kept compactly: a flat run of Floats (x, y, pressure) per mark, never the messages they came in.
-/// Every rule about which messages count lives here, so a live stroke, a staged replay and a rebuild all agree: a begin
-/// for an id already kept is dropped (not merged), points and ends for a mark that is not open are dropped, and the
-/// count is of unique marks.
+/// The Mac is the only place they are kept. Every rule about which messages count lives here, so a live stroke and a rebuild
+/// agree: a begin needs an id not yet held and a drawable first point, points and ends for a mark that is not open are
+/// ignored, and nothing is ever cut short quietly: past the caps a begin is refused and a stroke is ended where the cap is.
 private struct MarkStore: Sendable {
     struct Mark: Sendable {
         var color: String
@@ -27,13 +30,33 @@ private struct MarkStore: Sendable {
         var open: Bool
     }
 
-    /// What the Mac will hold: past this a begin or more points are refused (about 5 MB of points).
-    static let maxPoints = 400_000
-    static let maxMarks = 5_000
-    /// The page splits at 1000 points; a frame is under 60 KB.
-    static let maxPerMessage = 2_000
-    /// Points in one op of a rebuild.
-    static let chunk = 512
+    enum Refusal: Sendable {
+        case cap, noPoint, duplicate
+        var kind: String { self == .cap ? "cap" : "invalid" }
+        var why: String {
+            switch self {
+            case .cap: "Too many marks on this window. Clear them to keep drawing"
+            case .noPoint: "That mark had no point to draw"
+            case .duplicate: "That mark was already there"
+            }
+        }
+    }
+
+    enum Outcome {
+        /// Kept; this is the op to show in the overlay.
+        case accepted([String: Any])
+        /// Kept up to the cap and ended there: the ops to show, and how many points the mark has.
+        case cut(shown: [[String: Any]], id: Int, len: Int)
+        case refused(id: Int, Refusal)
+        /// Not for an open mark (or not a mark message at all).
+        case ignored
+    }
+
+    /// What the Mac will hold per window.
+    static let maxMarks = 500
+    static let maxPoints = 100_000
+    /// Points in one op sent to a page or the overlay (a frame stays well under 60 KB).
+    static let chunk = 400
 
     private(set) var marks: [Int: Mark] = [:]
     private(set) var order: [Int] = []
@@ -41,43 +64,56 @@ private struct MarkStore: Sendable {
 
     var count: Int { order.count }
 
-    /// Applies one begin, pts or end. Returns the op to show in the overlay (as accepted), or nil when it was dropped.
-    mutating func apply(_ msg: [String: Any]) -> [String: Any]? {
-        guard let op = msg["op"] as? String, let id = Self.id(msg["id"]) else { return nil }
+    mutating func apply(_ msg: [String: Any]) -> Outcome {
+        guard let op = msg["op"] as? String, let id = Self.id(msg["id"]) else { return .ignored }
         switch op {
         case "begin":
-            guard marks[id] == nil, order.count < Self.maxMarks, points < Self.maxPoints else { return nil }
+            if marks[id] != nil { return .refused(id: id, .duplicate) }
+            if order.count >= Self.maxMarks || points >= Self.maxPoints { return .refused(id: id, .cap) }
+            let all = Self.points(msg["pts"])
+            guard !all.isEmpty else { return .refused(id: id, .noPoint) }
+            let room = Self.maxPoints - points, have = all.count / 3
+            let kept = have > room ? Array(all.prefix(room * 3)) : all
             let color = Self.color(msg["color"])
             let size = min(0.05, max(0.0005, Self.num(msg["size"]) ?? 0.0065))
-            let pts = Self.points(msg["pts"], room: Self.maxPoints - points)
-            marks[id] = Mark(color: color, size: size, pts: pts, open: true)
+            marks[id] = Mark(color: color, size: size, pts: kept, open: have <= room)
             order.append(id)
-            points += pts.count / 3
-            return ["op": "begin", "id": id, "tool": "pen", "color": color, "size": size, "pts": Self.json(pts)]
+            points += kept.count / 3
+            let begin: [String: Any] = ["op": "begin", "id": id, "tool": "pen", "color": color, "size": size, "pts": Self.json(kept)]
+            return have > room ? .cut(shown: [begin, ["op": "end", "id": id]], id: id, len: room) : .accepted(begin)
         case "pts":
-            guard var mark = marks[id], mark.open, points < Self.maxPoints else { return nil }
-            let pts = Self.points(msg["pts"], room: Self.maxPoints - points)
-            guard !pts.isEmpty else { return nil }
-            mark.pts += pts
-            marks[id] = mark
-            points += pts.count / 3
-            return ["op": "pts", "id": id, "pts": Self.json(pts)]
+            guard let mark = marks[id], mark.open else { return .ignored }
+            let all = Self.points(msg["pts"])
+            guard !all.isEmpty else { return .ignored }
+            let room = Self.maxPoints - points, have = all.count / 3
+            guard room > 0 else {
+                marks[id]?.open = false
+                return .cut(shown: [["op": "end", "id": id]], id: id, len: mark.pts.count / 3)
+            }
+            let kept = have > room ? Array(all.prefix(room * 3)) : all
+            marks[id]?.pts.append(contentsOf: kept)
+            points += kept.count / 3
+            let more: [String: Any] = ["op": "pts", "id": id, "pts": Self.json(kept)]
+            guard have > room else { return .accepted(more) }
+            marks[id]?.open = false
+            return .cut(shown: [more, ["op": "end", "id": id]], id: id, len: mark.pts.count / 3 + room)
         case "end":
-            guard var mark = marks[id], mark.open else { return nil }
-            mark.open = false
-            marks[id] = mark
-            return ["op": "end", "id": id]
+            guard marks[id]?.open == true else { return .ignored }
+            marks[id]?.open = false
+            return .accepted(["op": "end", "id": id])
         default:
-            return nil
+            return .ignored
         }
     }
 
-    /// Every open mark is finished (a replay ends them all).
-    mutating func closeAll() {
-        for id in order where marks[id]?.open == true { marks[id]?.open = false }
+    /// Every open mark is finished (the Pencil that was drawing them is gone); returns their ids.
+    mutating func closeAll() -> [Int] {
+        let open = order.filter { marks[$0]?.open == true }
+        for id in open { marks[id]?.open = false }
+        return open
     }
 
-    /// The ops that rebuild exactly these marks in an empty overlay page.
+    /// The ops that rebuild exactly these marks in an empty page.
     func ops() -> [[String: Any]] {
         var out: [[String: Any]] = []
         for id in order {
@@ -112,7 +148,7 @@ private struct MarkStore: Sendable {
         return value
     }
 
-    private static func id(_ any: Any?) -> Int? {
+    static func id(_ any: Any?) -> Int? {
         guard let value = num(any), abs(value) < 1e9, value == value.rounded() else { return nil }
         return Int(value)
     }
@@ -122,16 +158,19 @@ private struct MarkStore: Sendable {
         return s.lowercased()
     }
 
-    private static func points(_ any: Any?, room: Int) -> [Float] {
+    /// Clamped to 0...1 and rounded to five places, as the page keeps them.
+    private static func r5(_ v: Double) -> Float { Float((min(max(v, 0), 1) * 1e5).rounded() / 1e5) }
+
+    /// Every drawable point in the list (a finite x and y), flat.
+    private static func points(_ any: Any?) -> [Float] {
         guard let list = any as? [Any] else { return [] }
         var out: [Float] = []
-        out.reserveCapacity(min(list.count, min(maxPerMessage, room)) * 3)
-        for item in list.prefix(min(maxPerMessage, max(0, room))) {
-            guard let p = item as? [Any], let x = num(p.first), p.count > 1, let y = num(p[1]) else { continue }
-            let pressure = p.count > 2 ? (num(p[2]) ?? 0.5) : 0.5
-            out.append(Float(min(max(x, 0), 1)))
-            out.append(Float(min(max(y, 0), 1)))
-            out.append(Float(min(max(pressure, 0), 1)))
+        out.reserveCapacity(list.count * 3)
+        for item in list {
+            guard let p = item as? [Any], p.count > 1, let x = num(p[0]), let y = num(p[1]) else { continue }
+            out.append(r5(x))
+            out.append(r5(y))
+            out.append(r5(p.count > 2 ? (num(p[2]) ?? 0.5) : 0.5))
         }
         return out
     }
@@ -154,36 +193,42 @@ private enum Presence: Equatable, Sendable {
 
 /// Reads the target window's place from the window server on its own queue, only while marks are up, and says so on
 /// the main actor when it changes. Fast while things move, slow once they have been still for a couple of seconds.
+/// Everything it keeps belongs to its queue; each tracking run has a number, and a report from an earlier run is dropped by the caller.
 private final class PresenceReader: @unchecked Sendable {
     private let queue = DispatchQueue(label: "pencilpad.annot.presence", qos: .userInitiated)
-    private let lock = NSLock()
     private var timer: DispatchSourceTimer?
-    private var window = CGWindowID(0), panel = 0
+    private var window = CGWindowID(0), panel = 0, track = 0
     private var last: Presence?
     private var still = 0, goneRuns = 0, slow = false
-    private let report: @Sendable (Presence) -> Void
+    private let report: @Sendable (Presence, Int) -> Void
 
-    init(report: @escaping @Sendable (Presence) -> Void) { self.report = report }
+    init(report: @escaping @Sendable (Presence, Int) -> Void) { self.report = report }
 
-    func start(window: CGWindowID) {
-        lock.lock(); self.window = window; panel = 0; last = nil; still = 0; goneRuns = 0; slow = false; lock.unlock()
-        guard timer == nil else { return }
-        let t = DispatchSource.makeTimerSource(queue: queue)
-        t.schedule(deadline: .now(), repeating: .milliseconds(40), leeway: .milliseconds(5))
-        t.setEventHandler { [weak self] in self?.tick() }
-        timer = t
-        t.resume()
+    func start(window: CGWindowID, track: Int) {
+        queue.async { [self] in
+            self.window = window; self.track = track; panel = 0; last = nil; still = 0; goneRuns = 0; slow = false
+            if timer == nil {
+                let t = DispatchSource.makeTimerSource(queue: queue)
+                t.setEventHandler { [weak self] in self?.tick() }
+                timer = t
+                t.resume()
+            }
+            timer?.schedule(deadline: .now(), repeating: .milliseconds(40), leeway: .milliseconds(5))
+        }
     }
 
-    func setPanel(_ number: Int) { lock.lock(); panel = number; lock.unlock() }
+    func setPanel(_ number: Int, track: Int) { queue.async { [self] in if self.track == track { panel = number } } }
 
     func stop() {
-        timer?.cancel()
-        timer = nil
+        queue.async { [self] in
+            timer?.cancel()
+            timer = nil
+            last = nil
+        }
     }
 
     private func tick() {
-        lock.lock(); let window = window, panel = panel; lock.unlock()
+        guard timer != nil else { return }
         var now = Self.read(window: window, panel: panel)
         if now == .gone {  // told only once it has stayed gone a few reads
             goneRuns += 1
@@ -199,11 +244,10 @@ private final class PresenceReader: @unchecked Sendable {
             if slow { slow = false; timer?.schedule(deadline: .now(), repeating: .milliseconds(40), leeway: .milliseconds(5)) }
         }
         last = now
-        report(now)
+        report(now, track)
     }
 
     private static func read(window: CGWindowID, panel: Int) -> Presence {
-        let me = ProcessInfo.processInfo.processIdentifier
         let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]] ?? []
         var target: Int?, over: Int?
         for (i, e) in list.enumerated() {
@@ -217,11 +261,9 @@ private final class PresenceReader: @unchecked Sendable {
         let entry = list[target]
         guard let bounds = entry[kCGWindowBounds as String] as? NSDictionary, let frame = CGRect(dictionaryRepresentation: bounds as CFDictionary) else { return .hidden }
         let layer = (entry[kCGWindowLayer as String] as? NSNumber)?.intValue ?? 0
-        // Directly over the window: the overlay is in front of it with nothing but PencilPad's own windows between.
-        var above = false
-        if let over, over < target {
-            above = list[(over + 1)..<target].allSatisfy { ($0[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value == me }
-        }
+        // Directly over the window: the very next one in front of it. Any window in between, one of PencilPad's own too (the
+        // Board window), would be under the ink, so the overlay is put back right over the target and that window covers it.
+        let above = over.map { $0 + 1 == target } ?? false
         return .onScreen(frame: frame, layer: layer, above: above)
     }
 }
@@ -272,44 +314,49 @@ private final class InkExporter: NSObject, WKNavigationDelegate {
     func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) { finish(false) }
 }
 
-/// Mouse mode's Annotate: the Pencil's marks over the target window. The iPad owns what it draws and sends every op;
-/// this keeps them (so a page that loads late, or again, gets all of them), shows them in an overlay window drawn by
-/// the same board-core.js, and saves the window's picture with the marks on top. Unlike the region outline the overlay
-/// is NOT kept out of shares and captures: it is there so the room sees the marks.
+/// Mouse mode's Annotate: the Pencil's marks over the target window. The Mac is the only place the marks are kept: the iPad
+/// draws its own stroke at once for feel and sends it, and is sent the Mac's marks whole after every hello, window choice and
+/// Clear. They are shown in an overlay window drawn by the same board-core.js, and saved over the window's picture. Unlike the
+/// region outline the overlay is NOT kept out of shares and captures: it is there so the room sees the marks.
 ///
-/// The overlay exists only while marks do (the web view is released on Clear), sits directly above the target window
-/// in the window order (so a window in front of the target covers the ink too), disappears with a hidden, minimized or
-/// other-Space target, and follows the window by what the window server reports, whoever is connected.
+/// The overlay, its web view and the reads of the window server exist only while marks do (the first mark makes them, the
+/// last one's going releases them). It sits directly above the target window in the window order (so any window in front of
+/// the target, PencilPad's Board window too, covers the ink), disappears with a hidden, minimized or other-Space target, and
+/// follows the window by what the window server reports, whoever is connected.
 @MainActor
 final class Annotation: NSObject {
-    /// A target choice took the marks away (the page clears its copy too).
-    var onReset: (() -> Void)?
     /// The target window is gone from the window server: the caller should ask the app (a read the Accessibility API confirms).
     var onTargetGone: (() -> Void)?
+    /// The window server's reading of the target window's frame, for the caller to adopt if the window was resized.
+    var onFrame: ((CGRect, CGWindowID) -> Void)?
 
-    /// Marks on show: unique strokes begun since the last clear.
+    /// Marks on show.
     var strokes: Int { store.count }
 
     private let targets: Targets
     private var store = MarkStore()
-    /// A replay on its way (one connection's, for one generation); swapped in whole by `commit`, dropped if the connection ends.
-    private var staged: (client: Int, gen: Int, store: MarkStore)?
     private var panel: AnnotPanel?
     private var webView: WKWebView?
     private var loaded = false
-    /// Ops waiting to be applied, sent in batches so the page sees them in arrival order.
+    /// Ops waiting to be applied, in order, once the page is up and idle.
     private var pending: [[String: Any]] = []
+    /// The overlay page must be rebuilt from the store before anything else (one flag, however many messages come meanwhile).
+    private var rebuild = false
     private var draining = false
     private var failures = 0
-    /// The window the marks are over (the window server's number), fixed when they began.
+    /// The window the marks are over (the window server's number), fixed when the first one was made.
     private var markedWindow: CGWindowID?
-    private lazy var reader = PresenceReader { [weak self] presence in
-        DispatchQueue.main.async { MainActor.assumeIsolated { self?.present(presence) } }
+    /// Numbers each run of the reader, so a read from an earlier run (an earlier window) is ignored.
+    private var track = 0
+    private lazy var reader = PresenceReader { [weak self] presence, track in
+        DispatchQueue.main.async { MainActor.assumeIsolated { self?.present(presence, track: track) } }
     }
 
     private static let pageURL = URL(string: "\(BoardPages.scheme)://board/annot.html")!
-    /// More than this waiting and the queue is replaced by a rebuild from the compact marks.
+    /// More than this waiting and the queue is dropped for a rebuild from the store.
     private static let maxPending = 2_000
+    /// Ops in one call to the overlay page.
+    private static let perCall = 20
 
     init(targets: Targets) {
         self.targets = targets
@@ -318,14 +365,41 @@ final class Annotation: NSObject {
 
     // MARK: Ops from the iPad
 
-    /// begin, pts or end (the caller has checked the generation): kept, and drawn in the overlay. Only a window target can be marked.
-    func apply(_ msg: [String: Any]) {
-        guard targets.current.id == "window" else { return }
+    /// Why Annotate cannot start on this target, or nil. It needs the window server's number for the window: no guessing by frame.
+    var refusal: String? {
+        guard targets.current.id == "window" else { return "Only a window can be marked" }
+        guard targets.windowID != nil else { return "Annotate can't tell this window from the others on this Mac, so it can't mark it" }
+        return nil
+    }
+
+    /// begin, pts or end (the caller has checked the generation): kept, and drawn in the overlay. Returns what the iPad is to be
+    /// told, if anything: a `drop` naming a begin that was refused, or a `cut` where a stroke was ended at the cap.
+    func apply(_ msg: [String: Any]) -> [String: Any]? {
+        if msg["op"] as? String == "begin", let why = refusal, let id = MarkStore.id(msg["id"]) {
+            return ["op": "drop", "id": id, "kind": "window", "why": why]
+        }
         let before = store.count
-        guard let op = store.apply(msg) else { return }
-        if before == 0, store.count > 0 { markedWindow = targets.windowID }
+        switch store.apply(msg) {
+        case .accepted(let op):
+            started(before)
+            enqueue(op)
+        case .cut(let shown, let id, let len):
+            started(before)
+            shown.forEach(enqueue)
+            return ["op": "cut", "id": id, "len": len, "why": "Too many points on this window. The mark ended here"]
+        case .refused(let id, let reason):
+            return ["op": "drop", "id": id, "kind": reason.kind, "why": reason.why]
+        case .ignored:
+            break
+        }
+        return nil
+    }
+
+    /// The first mark makes the overlay.
+    private func started(_ before: Int) {
+        guard before == 0, store.count > 0 else { return }
+        markedWindow = targets.windowID
         showOverlay()
-        enqueue(op)
     }
 
     /// Every mark gone, here and on screen.
@@ -336,56 +410,26 @@ final class Annotation: NSObject {
     }
 
     /// A target choice: whatever was marked belongs to the window before it.
-    func targetChosen() {
-        staged = nil
-        clear()
-        onReset?()
+    func targetChosen() { clear() }
+
+    /// The Pencil that was drawing is gone (the connection ended): its open marks are finished where they stand.
+    func closeOpen() {
+        for id in store.closeAll() { enqueue(["op": "end", "id": id]) }
     }
 
-    // MARK: Replay (the page's marks become the Mac's, whole or not at all)
-
-    func beginStage(client: Int, gen: Int) {
-        staged = (client, gen, MarkStore())
-    }
-
-    func stage(client: Int, gen: Int, _ msg: [String: Any]) {
-        guard staged?.client == client, staged?.gen == gen else { return }
-        _ = staged?.store.apply(msg)
-    }
-
-    /// The whole replay has arrived: swap it in, if it is complete (`count` marks) and for the target as it still is.
-    func commit(client: Int, gen: Int, count: Int) {
-        defer { staged = nil }
-        guard var next = staged?.store, staged?.client == client, staged?.gen == gen, gen == targets.generation,
-              targets.current.id == "window", next.count == count, count > 0 else {
-            log.error("annotate: replay not applied (incomplete or for another target)")
-            return
-        }
-        next.closeAll()
-        let before = store.count
-        store = next
-        if before == 0 { markedWindow = targets.windowID }
-        showOverlay()
-        resync()
-        log.notice("annotate: replay applied, \(count) marks")
-    }
-
-    /// The connection that was replaying is gone: what it had sent is dropped and the Mac's own marks stay.
-    func dropStage(client: Int) {
-        if staged?.client == client { staged = nil }
-    }
+    /// What a page is sent to show exactly these marks.
+    func syncOps() -> [[String: Any]] { store.ops() }
 
     // MARK: Overlay window
 
     private func showOverlay() {
-        guard store.count > 0, let markedWindow else { return }
-        let fresh = panel == nil
+        guard store.count > 0, let markedWindow, panel == nil else { return }
         ensurePanel()
-        if fresh { reader.start(window: markedWindow) }
+        track += 1
+        reader.start(window: markedWindow, track: track)
     }
 
     private func ensurePanel() {
-        guard panel == nil else { return }
         let panel = AnnotPanel(contentRect: NSRect(x: 0, y: 0, width: 100, height: 100), styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: true)
         panel.isOpaque = false
         panel.backgroundColor = .clear
@@ -419,7 +463,9 @@ final class Annotation: NSObject {
     /// Nothing is marked: the window, the web view behind it and the reads of the window server all go.
     private func teardown() {
         reader.stop()
+        track += 1
         pending.removeAll()
+        rebuild = false
         loaded = false
         markedWindow = nil
         failures = 0
@@ -432,8 +478,8 @@ final class Annotation: NSObject {
     }
 
     /// Follows the target: where it is, whether it is shown, and that the overlay is directly above it.
-    private func present(_ presence: Presence) {
-        guard let panel, let markedWindow else { return }
+    private func present(_ presence: Presence, track mine: Int) {
+        guard mine == track, let panel, let markedWindow else { return }
         switch presence {
         case .gone:
             panel.orderOut(nil)
@@ -448,8 +494,9 @@ final class Annotation: NSObject {
             if panel.level.rawValue != layer { panel.level = NSWindow.Level(rawValue: layer) }
             if !panel.isVisible || !above {
                 panel.order(.above, relativeTo: Int(markedWindow))
-                reader.setPanel(panel.windowNumber)
+                reader.setPanel(panel.windowNumber, track: mine)
             }
+            onFrame?(frame, markedWindow)
         }
     }
 
@@ -458,23 +505,19 @@ final class Annotation: NSObject {
         webView?.load(URLRequest(url: Self.pageURL))
     }
 
-    /// The page is up: it is given every mark so far.
+    /// The page is up (again): its failures are forgotten and it is rebuilt, once, from the marks held.
     fileprivate func pageLoaded() {
         loaded = true
-        resync()
-    }
-
-    /// The overlay page is made to show exactly the marks held: a clear, then every mark.
-    private func resync() {
-        guard loaded else { return }
-        pending = [["op": "clear"]] + store.ops()
+        failures = 0
+        rebuild = true
         Task { await drain() }
     }
 
+    /// A mark change for the overlay. While a rebuild is due it reads the store itself, so there is nothing to queue.
     private func enqueue(_ op: [String: Any]) {
-        guard loaded else { return }  // pageLoaded hands over everything kept so far
+        guard loaded, !rebuild else { return }  // pageLoaded hands over everything kept so far
         pending.append(op)
-        if pending.count > Self.maxPending { pending = [["op": "clear"]] + store.ops() }  // a page that cannot keep up gets a rebuild
+        if pending.count > Self.maxPending { pending = []; rebuild = true }  // a page that cannot keep up gets one rebuild
         Task { await drain() }
     }
 
@@ -482,16 +525,35 @@ final class Annotation: NSObject {
         guard !draining else { return }
         draining = true
         defer { draining = false }
-        while !pending.isEmpty, let webView, failures < 3 {
-            let batch = pending
-            pending = []
-            do {
-                _ = try await webView.callAsyncJavaScript("PencilAnnot.applyAll(list)", arguments: ["list": batch], in: nil, contentWorld: .page)
-                failures = 0
-            } catch {
-                failures += 1
-                log.error("annotate: apply failed: \(error.localizedDescription, privacy: .public)")
-                if failures < 3 { pending = [["op": "clear"]] + store.ops() }
+        while loaded, let webView, failures < 3, rebuild || !pending.isEmpty {
+            var batch: [[String: Any]]
+            if rebuild {
+                rebuild = false
+                pending = []
+                batch = [["op": "clear"]] + store.ops()  // read once, here: later changes queue behind it
+            } else {
+                batch = pending
+                pending = []
+            }
+            while !batch.isEmpty {
+                let part = Array(batch.prefix(Self.perCall))
+                batch.removeFirst(part.count)
+                do {
+                    _ = try await webView.callAsyncJavaScript("PencilAnnot.applyAll(list)", arguments: ["list": part], in: nil, contentWorld: .page)
+                } catch {
+                    failures += 1
+                    log.error("annotate: apply failed: \(error.localizedDescription, privacy: .public)")
+                    rebuild = true  // what was lost is put back from the store, not patched
+                    pending = []
+                    batch = []
+                }
+            }
+        }
+        if failures >= 3, loaded {  // the page is not drawing: a fresh one is loaded, and its load rebuilds everything
+            loaded = false
+            Task { [weak self] in
+                try? await Task.sleep(for: .seconds(2))
+                self?.loadPage()
             }
         }
     }
@@ -500,23 +562,27 @@ final class Annotation: NSObject {
 
     private enum SaveError: Error { case encode }
 
-    /// Saves the window's own picture (captured by itself, so a covered window is right) with the marks laid over it, at the
-    /// window's full pixel size, as a PNG on the Desktop. Which window, which target generation and which marks are all
-    /// fixed here, when the request arrives: whatever changes while the capture runs changes nothing in the file. Returns
-    /// the file name, or a plain reason.
-    func save(gen: Int?) async -> (name: String?, why: String?) {
-        guard targets.current.id == "window", let pid = targets.windowPID else { return (nil, "No window is the target") }
-        guard gen == targets.generation else { return (nil, "The window changed before the save; nothing was saved") }
+    /// Fixes, now, what a save is of: the window (its server number), and a value copy of the marks. Whatever changes after
+    /// this changes nothing in the file. The returned closure does the rest (capture, drawing, compositing, the write) and
+    /// answers with the file name, or a plain reason.
+    func beginSave() -> () async -> (name: String?, why: String?) {
+        guard targets.current.id == "window", let pid = targets.windowPID else { return { (nil, "No window is the target") } }
+        guard let windowID = targets.windowID else { return { (nil, "That window can't be told apart from the others on this Mac, so it was not saved") } }
+        let marks = store
+        return { [self] in await write(windowID: windowID, pid: pid, marks: marks) }
+    }
+
+    /// Captures window `windowID` by itself with ScreenCaptureKit (a covered window saves right, no cursor, no shadow, a window
+    /// partly past a screen's edge whole) at its full pixel size, lays the frozen marks over it, and writes the PNG to the Desktop.
+    private func write(windowID: CGWindowID, pid: pid_t, marks: MarkStore) async -> (name: String?, why: String?) {
         guard CGPreflightScreenCaptureAccess() else {
             return (nil, "Allow PencilPad under Screen Recording in System Settings, then tap Save again")
         }
-        let windowID = targets.windowID, rect = targets.current.rect
-        let strokes = store.snapshot()
         let shot: CGImage
         do {
             let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
-            guard let window = Projection.match(content.windows, id: windowID, pid: pid, rect: rect) else {
-                return (nil, windowID == nil ? "That window can't be told apart from another one right now" : "That window can't be captured right now")
+            guard let window = content.windows.first(where: { $0.windowID == windowID && $0.owningApplication?.processID == pid }) else {
+                return (nil, "That window can't be captured right now")
             }
             let filter = SCContentFilter(desktopIndependentWindow: window)
             let info = SCShareableContent.info(for: filter)
@@ -534,25 +600,26 @@ final class Annotation: NSObject {
             return (nil, "Screen capture failed: \(String(error.localizedDescription.prefix(80)))")
         }
         var inkURL: String?
-        if !strokes.isEmpty {
+        if marks.count > 0 {
+            let strokes = await Task.detached { JSONBox(value: marks.snapshot()) }.value.value  // off the input actor: a full store is a lot of numbers
             guard let exporter = InkExporter(pageURL: Self.pageURL), let url = await exporter.png(of: strokes, width: shot.width, height: shot.height) else {
                 return (nil, "The marks could not be drawn")
             }
             inkURL = url
         }
-        let base = ImageBox(image: shot), count = strokes.count, ink = inkURL
+        let base = ImageBox(image: shot), count = marks.count, ink = inkURL
         do {
             // Decoding, compositing, encoding and the write all stay off the main actor: the first write to the Desktop can sit behind a prompt.
             let name = try await Task.detached {
-                var marks: CGImage?
+                var overlay: CGImage?
                 if let ink {
                     let prefix = "data:image/png;base64,"
                     guard ink.hasPrefix(prefix), let data = Data(base64Encoded: String(ink.dropFirst(prefix.count))),
                           let source = CGImageSourceCreateWithData(data as CFData, nil), let image = CGImageSourceCreateImageAtIndex(source, 0, nil)
                     else { throw SaveError.encode }
-                    marks = image
+                    overlay = image
                 }
-                guard let png = Self.composite(base.image, marks) else { throw SaveError.encode }
+                guard let png = Self.composite(base.image, overlay) else { throw SaveError.encode }
                 return try SocketServer.saveToDesktop(png, kind: "Annotation")
             }.value
             log.notice("annotate saved \(name, privacy: .public) \(shot.width)x\(shot.height), \(count) strokes")
@@ -595,5 +662,15 @@ extension Annotation: WKNavigationDelegate {
         guard store.count > 0 else { teardown(); return }
         log.error("annotate: page process ended; loading it again")
         loadPage()
+    }
+
+    /// A load that fails is tried again shortly: the overlay is not left blank for good.
+    func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+        log.error("annotate: overlay page failed to load: \(error.localizedDescription, privacy: .public)")
+        guard store.count > 0 else { return }
+        Task { [weak self] in
+            try? await Task.sleep(for: .seconds(2))
+            if self?.loaded == false { self?.loadPage() }
+        }
     }
 }

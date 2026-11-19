@@ -209,7 +209,8 @@ final class Targets {
     }
 
     /// Makes the front app's focused window the target (read now, not persisted). `done` is told whether it worked.
-    func selectFrontWindow(_ done: @escaping @MainActor (Bool) -> Void) {
+    /// `owner` says whether whoever asked is still there; a choice that finishes after they are gone is not applied.
+    func selectFrontWindow(owner: @escaping @MainActor () -> Bool = { true }, _ done: @escaping @MainActor (Bool) -> Void) {
         let mine = choices.next(), choices = choices
         guard let front = NSWorkspace.shared.frontmostApplication else {
             log.error("target window: no frontmost app; keeping previous target")
@@ -226,8 +227,8 @@ final class Targets {
             DispatchQueue.main.async {
                 MainActor.assumeIsolated {
                     guard let self else { done(false); return }
-                    guard choices.isCurrent(mine) else {  // a newer choice came in while this one waited on the app
-                        log.notice("target: front window choice overtaken by a newer choice; not applied")
+                    guard choices.isCurrent(mine), owner() else {  // a newer choice came in, or the asker left, while this one waited on the app
+                        log.notice("target: front window choice overtaken or its client is gone; not applied")
                         done(false)
                         return
                     }
@@ -244,7 +245,7 @@ final class Targets {
     /// Makes window `n` of the latest list the target and brings it to the front: restore it if minimized,
     /// activate its app, raise it, make it the app's main window. `done` is told false (target unchanged) for an
     /// unknown id or a window that can no longer be read.
-    func pick(window n: Int, _ done: @escaping @MainActor (Bool) -> Void) {
+    func pick(window n: Int, owner: @escaping @MainActor () -> Bool = { true }, _ done: @escaping @MainActor (Bool) -> Void) {
         let mine = choices.next(), choices = choices
         guard let info = listed[n] else {
             log.error("target: unknown window id \(n); keeping \(self.current.name, privacy: .public)")
@@ -262,8 +263,8 @@ final class Targets {
             DispatchQueue.main.async {
                 MainActor.assumeIsolated {
                     guard let self else { done(false); return }
-                    guard choices.isCurrent(mine) else {  // a newer choice came in while this one waited on the app
-                        log.notice("target: window pick \(n) overtaken by a newer choice; not applied")
+                    guard choices.isCurrent(mine), owner() else {  // a newer choice came in, or the asker left, while this one waited on the app
+                        log.notice("target: window pick \(n) overtaken or its client is gone; not applied")
                         done(false)
                         return
                     }
@@ -314,6 +315,16 @@ final class Targets {
         }
     }
 
+    /// The window server's own reading of the window target's frame (the Annotate overlay's reader). A resize it sees reaches
+    /// the page and Show even while the Pencil is quiet. Never while a button is held, and a gap under 2 points is the two
+    /// sources disagreeing about the border, not a resize.
+    func adoptFrame(_ rect: CGRect, of window: CGWindowID) {
+        guard current.id == "window", windowID == window, pen.held == nil, rect.width >= 1, rect.height >= 1,
+              abs(rect.width - current.rect.width) >= 2 || abs(rect.height - current.rect.height) >= 2 else { return }
+        current = Target(id: current.id, name: current.name, rect: rect, app: current.app)
+        onFollowChange?()
+    }
+
     /// A fresh read of the window target's frame, for the first touch after a quiet spell. `done` runs once its answer has
     /// been applied, or at once if there is nothing to read (not a window, a button held, an app that is not answering).
     func refreshFrame(_ done: @escaping @MainActor () -> Void) {
@@ -355,8 +366,11 @@ final class Targets {
 }
 
 /// The window-server number of an Accessibility window (not in the public headers; the same call window managers use).
-@_silgen_name("_AXUIElementGetWindow")
-private func _AXUIElementGetWindow(_ element: AXUIElement, _ id: UnsafeMutablePointer<CGWindowID>) -> AXError
+/// Looked up by name, so a system without it gives no number (and Annotate refuses) instead of failing to launch.
+private let axWindowNumber: (@convention(c) (AXUIElement, UnsafeMutablePointer<CGWindowID>) -> AXError)? = {
+    guard let symbol = dlsym(UnsafeMutableRawPointer(bitPattern: -2), "_AXUIElementGetWindow") else { return nil }  // RTLD_DEFAULT
+    return unsafeBitCast(symbol, to: (@convention(c) (AXUIElement, UnsafeMutablePointer<CGWindowID>) -> AXError).self)
+}()
 
 /// All the Accessibility reads and actions on other apps' windows. Nothing here touches the Targets' state, so it all
 /// runs on `queue`, one call after another; the 0.5 s messaging timeout bounds what a stuck app can cost.
@@ -473,7 +487,8 @@ private enum AXWindows {
     /// The window server's number for an Accessibility window, or nil when the system will not say.
     static func windowID(_ window: AXUIElement) -> CGWindowID? {
         var id = CGWindowID(0)
-        return _AXUIElementGetWindow(window, &id) == .success && id != 0 ? id : nil
+        guard let call = axWindowNumber else { return nil }
+        return call(window, &id) == .success && id != 0 ? id : nil
     }
 
     /// The window's frame, or the AX error that stopped the read.
