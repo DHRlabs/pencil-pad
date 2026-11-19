@@ -746,8 +746,7 @@ zoomBtn.addEventListener('click', () => {
 // ---------- Show (projection) ----------
 
 // The Mac streams what is under the active area (the window, or the zoomed part of a screen) as JPEG frames. They are
-// drawn on a canvas exactly covering the active area, over the effects (screen-blended, with the effects' own
-// background dimmed inside the area), and each is acknowledged once drawn, so the Mac never has more than two in flight.
+// drawn on a canvas exactly covering the active area, over the page (the effects are stopped while it shows), and each is acknowledged once drawn, so the Mac never has more than two in flight.
 const PROJ_MAX = 2048;   // the longest side asked for, in device pixels
 const proj = $('proj'), projCtx = proj.getContext('2d'), showBtn = $('show'), hudFps = $('hud-fps');
 let showOn = false;                       // what the page wants
@@ -809,6 +808,7 @@ function updateShowUI() {
   const live = showOn && projLive && mode === 'mouse';
   body.classList.toggle('projecting', live);
   ui.projecting = live;
+  quietUI();
 }
 
 function clearProj() {
@@ -910,6 +910,13 @@ function setRight(on) {
 }
 rclickBtn.addEventListener('click', () => setRight(!ui.rightArmed));
 
+// No page effects on the Board or while Show is on: the loop is stopped, the canvas and the Effects button hidden.
+function quietUI() {
+  const q = mode === 'board' || showOn;
+  body.classList.toggle('quiet', q);
+  if (fx) fx.setQuiet(q);
+}
+
 let style = STYLES.includes(store.get('style')) ? store.get('style') : 'neon';
 function applyStyle() {
   body.dataset.style = style;
@@ -923,7 +930,7 @@ styleBtn.addEventListener('click', () => {
   applyStyle();
 });
 
-$('clear').addEventListener('click', () => { if (fx) fx.clear(); });
+$('clear').addEventListener('click', () => { if (fx && !body.classList.contains('quiet')) fx.clear(); });
 
 let aimMode = AIM_MODES.includes(store.get('aim')) ? store.get('aim') : 'soft';
 function aimTitle() {
@@ -1037,8 +1044,7 @@ const inkColor = () => (lightBg() ? (bColor === '#ffffff' ? '#000000' : bColor) 
 // ---------- Ink canvas (the board, over the three.js background) ----------
 
 let inkRaf = 0, dirtyUntil = 0;
-const sparks = [];
-let tip = { x: 0, y: 0, on: false, c: '#ffffff' }, lastTip = null;
+let tip = { x: 0, y: 0, on: false, c: '#ffffff' };   // the eraser ring follows it; Board mode has no other effects
 
 function placeInk() {
   const dpr = Math.min(3, window.devicePixelRatio || 1);
@@ -1060,7 +1066,7 @@ function inkFrame() {
   inkRaf = 0;
   bFlush();
   drawInk();
-  if (!inkRaf && (sparks.length || performance.now() < dirtyUntil)) inkRaf = requestAnimationFrame(inkFrame);
+  if (!inkRaf && performance.now() < dirtyUntil) inkRaf = requestAnimationFrame(inkFrame);
 }
 
 function drawInk() {
@@ -1068,53 +1074,19 @@ function drawInk() {
   if (!w || !h || mode !== 'board') return;
   view.draw(board, inkCtx, w, h);   // the board itself: identical to the Mac window
   if (shapeDrag) drawItem(inkCtx, w, h, { kind: 'shape', shape: bShape, color: inkColor(), size: bSize, ...shapeDrag }, board.bg);   // the shape being dragged, drawn exactly as it will land
-  // A subtle glow at the tip while inking, plus a few motes. Drawn over the board each frame, never into it.
-  const k = w / area.w, light = lightBg();
-  inkCtx.save();
-  inkCtx.globalCompositeOperation = light ? 'source-over' : 'lighter';
-  for (let i = sparks.length - 1; i >= 0; i--) {
-    const p = sparks[i];
-    p.x += p.vx * 0.016; p.y += p.vy * 0.016; p.vy += 50 * 0.016; p.life -= 0.016 * 2.4;
-    if (p.life <= 0) { sparks.splice(i, 1); continue; }
-    inkCtx.globalAlpha = (light ? 0.5 : 0.45) * p.life;
-    inkCtx.fillStyle = p.c;
-    inkCtx.beginPath(); inkCtx.arc(p.x, p.y, (0.8 + 1.8 * p.life) * k, 0, 6.2832); inkCtx.fill();
+  if (tip.on && bTool === 'eraser') {
+    const k = w / area.w, light = lightBg();
+    inkCtx.save();
+    inkCtx.strokeStyle = light ? 'rgba(20,24,40,0.55)' : 'rgba(255,255,255,0.6)';
+    inkCtx.lineWidth = Math.max(1, k * 1.2);
+    inkCtx.beginPath(); inkCtx.arc(tip.x, tip.y, ERASE_R * w, 0, 6.2832); inkCtx.stroke();
+    inkCtx.restore();
   }
-  if (tip.on) {
-    inkCtx.globalAlpha = 1;
-    if (bTool === 'eraser') {
-      inkCtx.strokeStyle = light ? 'rgba(20,24,40,0.55)' : 'rgba(255,255,255,0.6)';
-      inkCtx.lineWidth = Math.max(1, k * 1.2);
-      inkCtx.beginPath(); inkCtx.arc(tip.x, tip.y, ERASE_R * w, 0, 6.2832); inkCtx.stroke();
-    } else {
-      const R = 24 * k, g = inkCtx.createRadialGradient(tip.x, tip.y, 0, tip.x, tip.y, R);
-      g.addColorStop(0, light ? hexA(tip.c, 0.28) : 'rgba(255,255,255,0.42)');
-      g.addColorStop(0.45, hexA(tip.c, light ? 0.12 : 0.2));
-      g.addColorStop(1, hexA(tip.c, 0));
-      inkCtx.fillStyle = g;
-      inkCtx.beginPath(); inkCtx.arc(tip.x, tip.y, R, 0, 6.2832); inkCtx.fill();
-    }
-  }
-  inkCtx.restore();
-}
-
-function hexA(hex, a) {
-  const n = parseInt(hex.slice(1), 16);
-  return `rgba(${(n >> 16) & 255},${(n >> 8) & 255},${n & 255},${a})`;
 }
 
 // Pointer position in ink bitmap pixels.
 const bx = (clientX) => (clientX - area.x) / area.w * ink.width;
 const by = (clientY) => (clientY - area.y) / area.h * ink.height;
-
-function mote(x, y) {
-  if (lastTip && Math.hypot(x - lastTip.x, y - lastTip.y) > 4 && sparks.length < 24) {
-    const a = Math.atan2(y - lastTip.y, x - lastTip.x) + Math.PI + (Math.random() - 0.5);
-    const v = (30 + Math.random() * 90) * (ink.width / area.w);
-    sparks.push({ x, y, vx: Math.cos(a) * v, vy: Math.sin(a) * v - 20, life: 0.9, c: tip.c });
-  }
-  lastTip = { x, y };
-}
 
 // ---------- Board ops: apply locally, remember, send ----------
 
@@ -1232,7 +1204,6 @@ const bPressure = (e) => (e.pressure > 0 ? Math.round(e.pressure * 1000) / 1000 
 function boardDown(e, x, y) {
   if (!body.classList.contains('drawn')) body.classList.add('drawn');
   tip = { x: bx(x), y: by(y), on: true, c: inkColor() };
-  lastTip = null;
   bPending = [];
   if (bTool === 'eraser') {
     bErasing = true; bErase.clear();
@@ -1262,7 +1233,6 @@ function boardMove(e) {
       const X = normX(x), Y = normY(y), n = bPending.length;
       if (n ? bPending[n - 1][0] !== X || bPending[n - 1][1] !== Y : true) {
         bPending.push([X, Y, bPressure(ev)]);
-        mote(bx(x), by(y));
       }
     }
   }
@@ -1293,7 +1263,7 @@ function boardLift() {
   placing = null;
   bPending = [];
   tip.on = false;
-  wake(300);   // a last frame or two without the glow
+  wake(300);
   if (saveDeferred) saveSoon();
 }
 
@@ -1467,6 +1437,7 @@ function setMode(m) {
 
 function modeUI() {
   body.dataset.mode = mode;
+  quietUI();
   for (const b of modeBtns) b.setAttribute('aria-pressed', String(b.dataset.m === mode));
   syncClosed();
   bUI();
@@ -1833,5 +1804,5 @@ fit();
 connect();
 
 import('./fx.js')
-  .then((m) => { fx = m.start({ canvas: $('fx'), queue, ui }); fx.setStyle(style); })
+  .then((m) => { fx = m.start({ canvas: $('fx'), queue, ui }); fx.setQuiet(body.classList.contains('quiet')); fx.setStyle(style); })
   .catch((err) => { console.warn('PencilPad: effects unavailable, input still works.', err); body.classList.add('nofx'); });

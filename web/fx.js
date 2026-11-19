@@ -490,7 +490,7 @@ export function start({ canvas, queue, ui }) {
 
   // ---------- Frame loop ----------
 
-  let raf = 0, running = false, prevT = 0, skip = 0;
+  let raf = 0, running = false, quiet = false, styled = false, prevT = 0, skip = 0;
 
   function frame(now) {
     raf = requestAnimationFrame(frame);
@@ -528,6 +528,7 @@ export function start({ canvas, queue, ui }) {
   }
 
   function run(on) {
+    on = on && !quiet;
     if (on === running) return;
     running = on;
     if (on) { read = queue.head; prevT = (performance.now() - t0) / 1000; raf = requestAnimationFrame(frame); }
@@ -535,7 +536,8 @@ export function start({ canvas, queue, ui }) {
   }
 
   function setStyle(name) {
-    if (name === 'off' || !LOOKS[name]) { drawing = false; run(false); return; }
+    if (name === 'off' || !LOOKS[name]) { styled = false; drawing = false; run(false); return; }
+    styled = true;
     look = LOOKS[name];
     uStyle.value = look.id;
     uA.value.set(look.a); uB.value.set(look.b); uC.value.set(look.c);
@@ -550,6 +552,12 @@ export function start({ canvas, queue, ui }) {
     run(true);
   }
 
+  // Stopped, not hidden: no frames at all while the Board or a projected picture has the page.
+  function setQuiet(q) {
+    quiet = q;
+    if (q) { drawing = false; aimOn = false; run(false); } else run(styled);
+  }
+
   function clear() {
     const t = (performance.now() - t0) / 1000;
     uClearAt.value = t;
@@ -557,5 +565,5 @@ export function start({ canvas, queue, ui }) {
     ripple(a.x + a.w / 2, a.y + a.h / 2, t, 1.6);
   }
 
-  return { setStyle, clear };
+  return { setStyle, setQuiet, clear };
 }

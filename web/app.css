@@ -37,7 +37,7 @@ body {
 
 #fx, #surface { position: fixed; inset: 0; width: 100%; height: 100%; }
 #fx { display: block; }
-body[data-style="off"] #fx, body.nofx #fx { display: none; }
+body[data-style="off"] #fx, body.nofx #fx, body.quiet #fx, body.quiet #style { display: none; }
 #surface { touch-action: none; }
 
 /* Active area: the frame dims everything outside it with one big shadow. */
