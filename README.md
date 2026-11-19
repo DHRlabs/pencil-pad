@@ -37,7 +37,7 @@ Everything runs on your own network. Nothing loads from the internet while you u
 
 - Show streams the target Mac window or screen onto the iPad, so you can see what you are drawing on.
 - Tap Zoom and pinch into part of a screen, and the stream follows the part you zoomed to.
-- The picture is drawn over the page effects, and the Pencil keeps driving the Mac while it shows.
+- The page effects stop while it shows (and on the Board), and the Pencil keeps driving the Mac.
 
 ## Features
 
