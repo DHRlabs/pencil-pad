@@ -731,7 +731,7 @@ function createInkView() {
         key = k; gen = board.gen; baked = 0;
       }
       bctx.setTransform(1, 0, 0, 1, -ox, -oy);
-      while (baked < list.length && list[baked].ended) drawItem(bctx, W, H, list[baked++], 'ink');
+      while (baked < list.length && list[baked].ended) { drawItem(bctx, W, H, list[baked], 'ink'); baked++; }   // advances only once the item is drawn
       ctx.drawImage(base, 0, 0);
       ctx.setTransform(1, 0, 0, 1, -ox, -oy);
       for (let i = baked; i < list.length; i++) drawItem(ctx, W, H, list[i], 'ink');

@@ -16,6 +16,9 @@ final class Client {
     var held: [Data]?
     /// The target choice whose marks this connection was last sent whole (nil: none yet).
     var annotSynced: Int?
+    /// Version of the page's wire protocol, from its hello: 2 tags what it asks to see (`rev`) and expects tagged frames; a page whose
+    /// hello has no `v` (main's) gets main's frames and has its `rev` ignored.
+    var version = 1
 
     init(id: Int, conn: NWConnection) {
         self.id = id
@@ -89,7 +92,7 @@ final class SocketServer {
         }
         targets.onChoice = { [weak self] in  // every choice, even one that picked the same bounds again: its marks and its picture start over
             self?.annotation.targetChosen()
-            self?.projection.restart(choice: true)
+            self?.projection.choose()
         }
         targets.onFollowChange = { [weak self] in self?.pushTarget() }  // the window was resized, or went away
     }
@@ -184,6 +187,8 @@ final class SocketServer {
                 send(c, ["t": "annot", "op": "done", "rid": msg["rid"] ?? NSNull(), "ok": false, "why": "The window changed before the save; nothing was saved"])
             case "begin", "pts", "end":
                 send(c, annotMessage(["op": "drop", "id": msg["id"] ?? NSNull(), "kind": "stale"], gen: msg["gen"] ?? NSNull()))
+            case "clear", "on":  // no stroke to name; the page hears that it was for another choice (and its next sync is on its way)
+                send(c, annotMessage(["op": "drop", "kind": "stale", "why": "That was for another window choice"], gen: msg["gen"] ?? NSNull()))
             default:
                 break
             }
@@ -410,6 +415,7 @@ final class SocketServer {
         clients[c.id] = nil
         if active === c {
             active = nil
+            targets.cancelChoices()  // a pick still waiting on an app must not raise its window for nobody
             pen.release(reason: "client \(c.id) \(reason)")
             outline.reset()
             projection.hide()
@@ -443,6 +449,7 @@ final class SocketServer {
             pencilActive = false
             if targets.current.id == "window" { log.notice("follow: Pencil quiet for \(Int(Self.quietAfter)) s; background window reads paused") }
         }
+        targets.publishDeferredFrame()  // a held button was released some other way (the silence watchdog, a lost lift)
         if pencilActive { targets.followWindow() }  // keeps a window target's frame fresh while the Pencil is in use
         let silent = now - c.lastFrame
         if silent >= Self.idleLimit {
@@ -467,6 +474,7 @@ final class SocketServer {
 
         guard c.authed else {
             if t == "hello", let token = msg["token"] as? String, token == Settings.token {
+                c.version = Self.integer(msg["v"], in: 0...2) == 2 ? 2 : 1
                 authenticate(c)
             } else {
                 deny(c, why: t == "hello" ? "wrong token" : "first frame was not hello")
@@ -524,6 +532,7 @@ final class SocketServer {
             if let at { pen.move(at, pressure: pressure, tilt: tilt) }
         case "up":
             if let at { pen.up(at) } else { pen.release(reason: "up without coordinates") }
+            targets.publishDeferredFrame()  // a resize seen while the button was held
         case "target":
             targets.followWindow(force: true)  // a fresh read is on its way; a resize is pushed when it lands
             // Every request is answered with the target, even when nothing changed, so the page stays in sync.
@@ -555,16 +564,18 @@ final class SocketServer {
             // The part of the target the iPad is zoomed to. Pencil coordinates already arrive mapped into it;
             // the Mac only draws it for a moment.
             if let rx = x, let ry = y, let rw = num("w"), let rh = num("h") {
+                guard let rev = pageRev(c, msg) else { return }
                 let w = min(max(rw, 0.01), 1), h = min(max(rh, 0.01), 1)
                 outline.set(CGRect(x: min(max(rx, 0), 1 - w), y: min(max(ry, 0), 1 - h), width: w, height: h))
-                projection.restart()  // the picture of the old part is never sent behind the new part's marks
+                projection.region(rev: rev)  // pictures of the old part are never sent under this rev
                 lastContact = ProcessInfo.processInfo.systemUptime  // the outline was just on show
             }
         case "show":
             // Project the target area onto the iPad as w x h pixel frames, or stop.
             if msg["on"] as? Bool == true {
                 if let w = num("w").flatMap({ Int(exactly: $0.rounded()) }), let h = num("h").flatMap({ Int(exactly: $0.rounded()) }) {
-                    projection.show(owner: c.id, w: w, h: h)
+                    guard let rev = pageRev(c, msg) else { return }
+                    projection.show(owner: c.id, w: w, h: h, rev: rev, tagged: c.version == 2)
                 }
             } else {
                 projection.hide()
@@ -586,6 +597,26 @@ final class SocketServer {
         default:
             log.debug("client \(c.id): unknown message \(t, privacy: .public)")
         }
+    }
+
+    /// A JSON number that is a whole number inside `range` (not a Boolean, a fraction, or out of range), else nil. Checked before any
+    /// conversion, so no value from the wire can trap.
+    nonisolated static func integer(_ any: Any?, in range: ClosedRange<Int>) -> Int? {
+        guard let n = any as? NSNumber, CFGetTypeID(n) == CFNumberGetTypeID() else { return nil }
+        let d = n.doubleValue
+        guard d.isFinite, d == d.rounded(), d >= Double(range.lowerBound), d <= Double(range.upperBound) else { return nil }
+        return Int(d)
+    }
+
+    /// The `rev` on a `show` or `region` from a v2 page, as the 16 bits that ride on frames (0 for main's page, whose `rev` is
+    /// ignored). A v2 page's message with no usable `rev` (not a whole number from 0 to 2^31) is ignored.
+    private func pageRev(_ c: Client, _ msg: [String: Any]) -> UInt16? {
+        guard c.version == 2 else { return 0 }
+        guard let rev = Self.integer(msg["rev"], in: 0...(1 << 31)) else {
+            log.notice("client \(c.id): \(msg["t"] as? String ?? "", privacy: .public) without a usable rev; ignored")
+            return nil
+        }
+        return UInt16(truncatingIfNeeded: rev)
     }
 
     /// The fresh frame is in (or the wait ran out): the touch that waited, and what came behind it, go through in order.

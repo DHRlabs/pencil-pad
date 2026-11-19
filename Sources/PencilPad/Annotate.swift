@@ -15,9 +15,6 @@ private final class AnnotPanel: NSPanel {
 /// A finished image carried to a detached task.
 private struct ImageBox: @unchecked Sendable { let image: CGImage }
 
-/// Plain JSON values (numbers, strings, arrays) carried between actors.
-private struct JSONBox: @unchecked Sendable { let value: [[String: Any]] }
-
 /// The marks themselves, kept compactly: a flat run of Floats (x, y, pressure) per mark, never the messages they came in.
 /// The Mac is the only place they are kept. Every rule about which messages count lives here, so a live stroke and a rebuild
 /// agree: a begin needs an id not yet held and a drawable first point, points and ends for a mark that is not open are
@@ -32,7 +29,13 @@ private struct MarkStore: Sendable {
 
     enum Refusal: Sendable {
         case cap, noPoint, duplicate
-        var kind: String { self == .cap ? "cap" : "invalid" }
+        var kind: String {
+            switch self {
+            case .cap: "cap"
+            case .duplicate: "dup"  // the page keeps the stroke it already had; it must not erase it
+            case .noPoint: "invalid"
+            }
+        }
         var why: String {
             switch self {
             case .cap: "Too many marks on this window. Clear them to keep drawing"
@@ -70,7 +73,7 @@ private struct MarkStore: Sendable {
         case "begin":
             if marks[id] != nil { return .refused(id: id, .duplicate) }
             if order.count >= Self.maxMarks || points >= Self.maxPoints { return .refused(id: id, .cap) }
-            let all = Self.points(msg["pts"])
+            let all = Self.points(msg["pts"], firstMustDraw: true)
             guard !all.isEmpty else { return .refused(id: id, .noPoint) }
             let room = Self.maxPoints - points, have = all.count / 3
             let kept = have > room ? Array(all.prefix(room * 3)) : all
@@ -83,7 +86,7 @@ private struct MarkStore: Sendable {
             return have > room ? .cut(shown: [begin, ["op": "end", "id": id]], id: id, len: room) : .accepted(begin)
         case "pts":
             guard let mark = marks[id], mark.open else { return .ignored }
-            let all = Self.points(msg["pts"])
+            let all = Self.points(msg["pts"], firstMustDraw: false)
             guard !all.isEmpty else { return .ignored }
             let room = Self.maxPoints - points, have = all.count / 3
             guard room > 0 else {
@@ -143,9 +146,10 @@ private struct MarkStore: Sendable {
 
     // MARK: Parsing
 
+    /// A finite JSON number. A Boolean is not one (it would read as 0 or 1).
     private static func num(_ any: Any?) -> Double? {
-        guard let value = (any as? NSNumber)?.doubleValue, value.isFinite else { return nil }
-        return value
+        guard let n = any as? NSNumber, CFGetTypeID(n) == CFNumberGetTypeID(), n.doubleValue.isFinite else { return nil }
+        return n.doubleValue
     }
 
     static func id(_ any: Any?) -> Int? {
@@ -161,13 +165,17 @@ private struct MarkStore: Sendable {
     /// Clamped to 0...1 and rounded to five places, as the page keeps them.
     private static func r5(_ v: Double) -> Float { Float((min(max(v, 0), 1) * 1e5).rounded() / 1e5) }
 
-    /// Every drawable point in the list (a finite x and y), flat.
-    private static func points(_ any: Any?) -> [Float] {
+    /// Every drawable point in the list (a finite x and y), flat. With `firstMustDraw` (a begin) the very first one has to be
+    /// drawable, else nothing is kept: a later point is not made the start of a mark the page never drew that way.
+    private static func points(_ any: Any?, firstMustDraw: Bool) -> [Float] {
         guard let list = any as? [Any] else { return [] }
         var out: [Float] = []
         out.reserveCapacity(list.count * 3)
-        for item in list {
-            guard let p = item as? [Any], p.count > 1, let x = num(p[0]), let y = num(p[1]) else { continue }
+        for (i, item) in list.enumerated() {
+            guard let p = item as? [Any], p.count > 1, let x = num(p[0]), let y = num(p[1]) else {
+                if i == 0, firstMustDraw { return [] }
+                continue
+            }
             out.append(r5(x))
             out.append(r5(y))
             out.append(r5(p.count > 2 ? (num(p[2]) ?? 0.5) : 0.5))
@@ -284,8 +292,9 @@ private final class InkExporter: NSObject, WKNavigationDelegate {
         view.load(URLRequest(url: pageURL))
     }
 
-    /// The marks alone, transparent, as a PNG data URL `width` x `height` pixels; nil when the page did not come up or draw.
-    func png(of strokes: [[String: Any]], width: Int, height: Int) async -> String? {
+    /// The marks alone, transparent, as a PNG data URL `width` x `height` pixels; nil when the page did not come up or draw. The marks
+    /// arrive as one JSON string, so the hand-off to WebKit (which happens on the main actor) is a single string; the page parses it.
+    func png(of strokes: String, width: Int, height: Int) async -> String? {
         let up = await withCheckedContinuation { (c: CheckedContinuation<Bool, Never>) in
             continuation = c
             Task { [weak self] in
@@ -295,7 +304,7 @@ private final class InkExporter: NSObject, WKNavigationDelegate {
         }
         guard up else { return nil }
         do {
-            let result = try await view.callAsyncJavaScript("PencilAnnot.loadStrokes(list); return PencilAnnot.png(w, h)",
+            let result = try await view.callAsyncJavaScript("PencilAnnot.loadStrokes(JSON.parse(list)); return PencilAnnot.png(w, h)",
                                                             arguments: ["list": strokes, "w": width, "h": height], in: nil, contentWorld: .page)
             return result as? String
         } catch {
@@ -348,9 +357,8 @@ final class Annotation: NSObject {
     private var markedWindow: CGWindowID?
     /// Numbers each run of the reader, so a read from an earlier run (an earlier window) is ignored.
     private var track = 0
-    private lazy var reader = PresenceReader { [weak self] presence, track in
-        DispatchQueue.main.async { MainActor.assumeIsolated { self?.present(presence, track: track) } }
-    }
+    /// Made by the first mark, released with the last (nil: nothing is being read).
+    private var reader: PresenceReader?
 
     private static let pageURL = URL(string: "\(BoardPages.scheme)://board/annot.html")!
     /// More than this waiting and the queue is dropped for a rebuild from the store.
@@ -426,6 +434,10 @@ final class Annotation: NSObject {
         guard store.count > 0, let markedWindow, panel == nil else { return }
         ensurePanel()
         track += 1
+        let reader = PresenceReader { [weak self] presence, track in
+            DispatchQueue.main.async { MainActor.assumeIsolated { self?.present(presence, track: track) } }
+        }
+        self.reader = reader
         reader.start(window: markedWindow, track: track)
     }
 
@@ -462,7 +474,8 @@ final class Annotation: NSObject {
 
     /// Nothing is marked: the window, the web view behind it and the reads of the window server all go.
     private func teardown() {
-        reader.stop()
+        reader?.stop()  // cancels its timer on its own queue; nothing keeps the reader or the queue alive after that
+        reader = nil
         track += 1
         pending.removeAll()
         rebuild = false
@@ -494,7 +507,7 @@ final class Annotation: NSObject {
             if panel.level.rawValue != layer { panel.level = NSWindow.Level(rawValue: layer) }
             if !panel.isVisible || !above {
                 panel.order(.above, relativeTo: Int(markedWindow))
-                reader.setPanel(panel.windowNumber, track: mine)
+                reader?.setPanel(panel.windowNumber, track: mine)
             }
             onFrame?(frame, markedWindow)
         }
@@ -539,7 +552,7 @@ final class Annotation: NSObject {
                 let part = Array(batch.prefix(Self.perCall))
                 batch.removeFirst(part.count)
                 do {
-                    _ = try await webView.callAsyncJavaScript("PencilAnnot.applyAll(list)", arguments: ["list": part], in: nil, contentWorld: .page)
+                    _ = try await webView.callAsyncJavaScript("return PencilAnnot.applyAll(list)", arguments: ["list": part], in: nil, contentWorld: .page)
                 } catch {
                     failures += 1
                     log.error("annotate: apply failed: \(error.localizedDescription, privacy: .public)")
@@ -575,34 +588,15 @@ final class Annotation: NSObject {
     /// Captures window `windowID` by itself with ScreenCaptureKit (a covered window saves right, no cursor, no shadow, a window
     /// partly past a screen's edge whole) at its full pixel size, lays the frozen marks over it, and writes the PNG to the Desktop.
     private func write(windowID: CGWindowID, pid: pid_t, marks: MarkStore) async -> (name: String?, why: String?) {
-        guard CGPreflightScreenCaptureAccess() else {
-            return (nil, "Allow PencilPad under Screen Recording in System Settings, then tap Save again")
-        }
-        let shot: CGImage
-        do {
-            let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
-            guard let window = content.windows.first(where: { $0.windowID == windowID && $0.owningApplication?.processID == pid }) else {
-                return (nil, "That window can't be captured right now")
-            }
-            let filter = SCContentFilter(desktopIndependentWindow: window)
-            let info = SCShareableContent.info(for: filter)
-            let scale = Double(info.pointPixelScale)
-            let config = SCStreamConfiguration()
-            config.width = max(1, Int((info.contentRect.width * scale).rounded()))
-            config.height = max(1, Int((info.contentRect.height * scale).rounded()))
-            config.pixelFormat = kCVPixelFormatType_32BGRA
-            config.showsCursor = false
-            config.ignoreShadowsSingleWindow = true
-            config.ignoreGlobalClipSingleWindow = true  // a window partly past the screen's edge is captured whole
-            shot = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
-        } catch {
-            log.error("annotate: capture failed: \(error.localizedDescription, privacy: .public)")
-            return (nil, "Screen capture failed: \(String(error.localizedDescription.prefix(80)))")
-        }
+        let captured = await Self.capture(windowID: windowID, pid: pid)  // all of ScreenCaptureKit's setup and capture run off the input actor
+        guard let shot = captured.image?.image else { return (nil, captured.why ?? "Screen capture failed") }
         var inkURL: String?
         if marks.count > 0 {
-            let strokes = await Task.detached { JSONBox(value: marks.snapshot()) }.value.value  // off the input actor: a full store is a lot of numbers
-            guard let exporter = InkExporter(pageURL: Self.pageURL), let url = await exporter.png(of: strokes, width: shot.width, height: shot.height) else {
+            // Expanded and serialized off the input actor: a full store is hundreds of thousands of numbers.
+            let strokes = await Task.detached { () -> String? in
+                (try? JSONSerialization.data(withJSONObject: marks.snapshot())).flatMap { String(data: $0, encoding: .utf8) }
+            }.value
+            guard let strokes, let url = await inkPNG(of: strokes, width: shot.width, height: shot.height) else {
                 return (nil, "The marks could not be drawn")
             }
             inkURL = url
@@ -628,6 +622,49 @@ final class Annotation: NSObject {
             log.error("annotate: save failed: \(error.localizedDescription, privacy: .public)")
             return (nil, "The file could not be written to the Desktop")
         }
+    }
+
+    /// The window `windowID` of `pid`, captured by itself at its full pixel size; or a plain reason. Runs off the main actor.
+    private nonisolated static func capture(windowID: CGWindowID, pid: pid_t) async -> (image: ImageBox?, why: String?) {
+        guard CGPreflightScreenCaptureAccess() else {
+            return (nil, "Allow PencilPad under Screen Recording in System Settings, then tap Save again")
+        }
+        do {
+            let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
+            guard let window = content.windows.first(where: { $0.windowID == windowID && $0.owningApplication?.processID == pid }) else {
+                return (nil, "That window can't be captured right now")
+            }
+            let filter = SCContentFilter(desktopIndependentWindow: window)
+            let info = SCShareableContent.info(for: filter)
+            let scale = Double(info.pointPixelScale)
+            let config = SCStreamConfiguration()
+            config.width = max(1, Int((info.contentRect.width * scale).rounded()))
+            config.height = max(1, Int((info.contentRect.height * scale).rounded()))
+            config.pixelFormat = kCVPixelFormatType_32BGRA
+            config.showsCursor = false
+            config.ignoreShadowsSingleWindow = true
+            config.ignoreGlobalClipSingleWindow = true  // a window partly past the screen's edge is captured whole
+            return (ImageBox(image: try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)), nil)
+        } catch {
+            log.error("annotate: capture failed: \(error.localizedDescription, privacy: .public)")
+            return (nil, "Screen capture failed: \(String(error.localizedDescription.prefix(80)))")
+        }
+    }
+
+    /// The frozen marks drawn alone, as a PNG data URL. While marks exist the overlay's own page does it (on a board of its own, so
+    /// nothing live is touched and nothing has to be created on the main actor); after a Clear it is a page made for the purpose.
+    private func inkPNG(of strokes: String, width: Int, height: Int) async -> String? {
+        if loaded, let view = webView {
+            do {
+                let result = try await view.callAsyncJavaScript("return PencilAnnot.pngOf(JSON.parse(list), w, h)",
+                                                                arguments: ["list": strokes, "w": width, "h": height], in: nil, contentWorld: .page)
+                if let url = result as? String { return url }
+            } catch {
+                log.error("annotate: overlay could not draw the save: \(error.localizedDescription, privacy: .public)")
+            }
+        }
+        guard let exporter = InkExporter(pageURL: Self.pageURL) else { return nil }
+        return await exporter.png(of: strokes, width: width, height: height)
     }
 
     private nonisolated static func composite(_ base: CGImage, _ marks: CGImage?) -> Data? {

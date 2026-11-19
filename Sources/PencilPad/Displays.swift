@@ -104,6 +104,8 @@ final class Targets {
     private var nextRead: TimeInterval = 0
     /// An app that did not answer is not asked again before this, not even for a Pencil down.
     private var retryAfter: TimeInterval = 0
+    /// A resize the window server reported while a button was held (see `adoptFrame`).
+    private var deferredFrame: (rect: CGRect, window: CGWindowID)?
     /// The window list the page last asked for. Pick ids index into it until the next list.
     private var listed: [Int: WindowInfo] = [:]
     /// Which list request is the newest; an older one that finishes later is dropped, not answered.
@@ -289,9 +291,13 @@ final class Targets {
         choose()
     }
 
+    /// The client that asked for the choices still waiting is gone: none of them may take effect or raise a window any more.
+    func cancelChoices() { _ = choices.next() }
+
     /// A target choice took effect: marks and pictures made for the one before are no longer this one's.
     private func choose() {
         generation += 1
+        deferredFrame = nil
         onChoice?()
     }
 
@@ -316,13 +322,24 @@ final class Targets {
     }
 
     /// The window server's own reading of the window target's frame (the Annotate overlay's reader). A resize it sees reaches
-    /// the page and Show even while the Pencil is quiet. Never while a button is held, and a gap under 2 points is the two
-    /// sources disagreeing about the border, not a resize.
+    /// the page and Show even while the Pencil is quiet. Not while a button is held (it is published on release), and a gap under
+    /// 2 points is the two sources disagreeing about the border, not a resize.
     func adoptFrame(_ rect: CGRect, of window: CGWindowID) {
-        guard current.id == "window", windowID == window, pen.held == nil, rect.width >= 1, rect.height >= 1,
+        guard current.id == "window", windowID == window, rect.width >= 1, rect.height >= 1,
               abs(rect.width - current.rect.width) >= 2 || abs(rect.height - current.rect.height) >= 2 else { return }
+        // While a button is held the geometry the drag started in stays; the reader will not say it again, so it is remembered
+        // and published on release (see `publishDeferredFrame`).
+        guard pen.held == nil else { deferredFrame = (rect, window); return }
+        deferredFrame = nil
         current = Target(id: current.id, name: current.name, rect: rect, app: current.app)
         onFollowChange?()
+    }
+
+    /// The last resize the window server showed while a button was held: applied now that it is not.
+    func publishDeferredFrame() {
+        guard pen.held == nil, let (rect, window) = deferredFrame else { return }
+        deferredFrame = nil
+        adoptFrame(rect, of: window)
     }
 
     /// A fresh read of the window target's frame, for the first touch after a quiet spell. `done` runs once its answer has

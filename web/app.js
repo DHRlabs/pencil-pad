@@ -345,7 +345,7 @@ function connect() {
   ws = s;
   s.onopen = () => {
     lastRx = performance.now();
-    s.send(JSON.stringify({ t: 'hello', token }));
+    s.send(JSON.stringify({ t: 'hello', token, v: 2 }));   // v 2: this page numbers what it wants to see (rev) and the Mac tags its frames with it
     pingTimer = setInterval(() => {
       if (s.readyState !== 1) return;
       if (performance.now() - lastRx > DEAD_MS) { retry(s); return; }   // the Mac went silent: the socket is dead
@@ -390,7 +390,7 @@ function onMessage(data) {
       break;
     case 'hello':
       ready = true; backoff = 500; regionSent = ''; showKey = '';
-      annotReady = false; picRestart();   // the Mac's marks and a new stream's frames are on their way
+      annotReady = false; bumpRev();   // the Mac's marks are on their way; so is a picture, asked for again below
       screens = Array.isArray(m.screens) ? m.screens : [];
       setConn('live', 'Connected');
       renderTargets();
@@ -490,7 +490,7 @@ function setTarget(t) {
   // belong to what was there before and go, and nothing is drawn until the Mac has sent this choice's marks.
   const newChoice = typeof t.gen === 'number' && t.gen !== (target && target.gen);
   const hadMarks = !!marks && marks.items.length > 0;
-  if (newChoice) { annotDrop(); annotReady = false; clearProj(); picRestart(); }
+  if (newChoice) { annotDrop(); annotReady = false; clearProj(); bumpRev(); showKey = ''; }   // the picture of what was there goes at once and is asked for again (fit below)
   target = t;
   if (t.w > 0 && t.h > 0) store.set('aspect', String(t.w / t.h));
   if (changed) { loadRegion(t); regionSent = ''; }   // that target's own zoom, and the Mac hears it once
@@ -631,8 +631,8 @@ function flushRegion() {
   if (saved !== regionSaved && !zoomPtrs.size) { regionSaved = saved; store.set('region.' + regionKey(target), s); }   // once, when the fingers lift
   if (ready && s !== regionSent) {
     regionSent = s;
-    send(`{"t":"region","x":${v[0]},"y":${v[1]},"w":${v[2]},"h":${v[3]}}`);
-    picRestart();   // the Mac numbers its frames from 1 again for this part; pictures of the old part are not drawn
+    bumpRev();   // the old picture may stay until a frame made for this part arrives; none made for the old part is drawn
+    send(`{"t":"region","x":${v[0]},"y":${v[1]},"w":${v[2]},"h":${v[3]},"rev":${projRev}}`);
   }
   syncShow();
 }
@@ -795,12 +795,11 @@ function syncShow() {
     key = `${w}x${h} ${regionKey(target)} ${target.w}x${target.h} ${[region.x, region.y, region.w, region.h].map(r5)}`;
   }
   if (key === showKey || (key === 'off' && showKey === '')) return;
-  const wasOff = showKey === 'off' || showKey === '';
   showKey = key;
   if (want) {
     const [w, h] = projSize();
-    if (wasOff) picRestart();   // a new stream: its frames start at 1
-    send(`{"t":"show","on":true,"w":${w},"h":${h}}`);
+    bumpRev();   // a new stream, a resize, another window or another part: whatever arrives for the old one is not drawn
+    send(`{"t":"show","on":true,"w":${w},"h":${h},"rev":${projRev}}`);
   } else { send('{"t":"show","on":false}'); }
 }
 
@@ -831,34 +830,35 @@ function setShow(on, remember) {
 
 showBtn.addEventListener('click', () => setShow(!showOn, true));
 
-// The Mac numbers its frames from 1 for each stream, and starts over at 1 after every window choice and every region change,
-// sending nothing of the old numbering after that. So the page, once it has asked for a new stream (a target change, a region
-// message, Show on), ignores frames (no ack either) until it sees number 1, and a picture still being decoded from before is
-// never painted. That way a picture of another window, or of a part the iPad has moved away from, is not drawn behind the marks.
-let picWait = true;     // ignoring frames until number 1
-let picEpoch = 0;       // moves with every restart; a decode that finishes under an older one is dropped
-function picRestart() { picWait = true; picEpoch++; }
+// Which picture a frame is of travels with it. The page numbers what it wants to see (`rev`) and bumps it whenever that changes:
+// a window chosen, a region change, Show on or resized, the page visible again, a reconnect. Every `show` and `region` carries
+// the current one, the Mac tags each frame with the one whose window and crop it was made under, and the page draws a frame only
+// if its tag is the current one, checked again after the decode, right before painting. So a picture of another window, or of
+// a part the iPad has moved away from, is never drawn behind the marks. After a region change the old picture may stay until the
+// first matching frame arrives (the accepted limit, up to about 200 ms); after a window choice the picture is cleared at once.
+let projRev = 0;
+const bumpRev = () => { projRev = (projRev + 1) % 2147483648; };   // stays inside what the Mac accepts: a whole number, 0 to 2^31
+const revTag = () => projRev & 0xffff;                             // frames carry it modulo 65536
 
-// One binary frame: a 4-byte big-endian number, then the JPEG. Acknowledged once drawn (or dropped).
+// One binary frame: a 4-byte big-endian number, a 2-byte tag, then the JPEG. Acknowledged once drawn or dropped, always, so
+// the Mac's two-frame limit never waits on a picture this page threw away.
 function onFrameBytes(buf) {
-  if (!(buf instanceof ArrayBuffer) || buf.byteLength < 6) return;
-  const n = new DataView(buf).getUint32(0), blob = new Blob([new Uint8Array(buf, 4)], { type: 'image/jpeg' });
-  if (picWait) { if (n !== 1) return; picWait = false; }
-  const epoch = picEpoch;
-  projChain = projChain.then(() => drawFrame(n, blob, epoch));
+  if (!(buf instanceof ArrayBuffer) || buf.byteLength < 7) return;
+  const dv = new DataView(buf), n = dv.getUint32(0), tag = dv.getUint16(4), blob = new Blob([new Uint8Array(buf, 6)], { type: 'image/jpeg' });
+  projChain = projChain.then(() => drawFrame(n, blob, tag));
 }
 
-async function drawFrame(n, blob, epoch) {
+async function drawFrame(n, blob, tag) {
   try {
     // The Pencil's own work comes first: while it is down the next picture waits its turn, and the ack waits with it,
     // so the Mac holds back (its two-frame limit) and the rate falls by itself; it returns to full the moment the Pencil lifts.
-    if (penId !== -1) {
+    if (tag === revTag() && penId !== -1) {
       const wait = PROJ_PEN_MS - (performance.now() - projDrawnAt);
       if (wait > 0) await new Promise((r) => setTimeout(r, wait));
     }
-    if (showOn && epoch === picEpoch && mode === 'mouse' && !pageHidden()) {
+    if (showOn && tag === revTag() && mode === 'mouse' && !pageHidden()) {
       const bmp = await createImageBitmap(blob);
-      if (showOn && epoch === picEpoch) {
+      if (showOn && tag === revTag()) {
         projCtx.drawImage(bmp, 0, 0, proj.width, proj.height);
         projDrawnAt = performance.now();
         if (projLast) projLast.close();
@@ -868,7 +868,7 @@ async function drawFrame(n, blob, epoch) {
       } else bmp.close();
     }
   } catch (_) {}
-  if (epoch === picEpoch) send(`{"t":"frame","ack":${n}}`);   // the Mac holds the next frames back until it hears this (an old numbering's are not its)
+  send(`{"t":"frame","ack":${n}}`);   // the Mac holds the next frames back until it hears this
 }
 
 // The Mac's answer: frames are coming, or why not (the stream is already stopped).
@@ -1195,6 +1195,7 @@ function sendExport(what) {
 function macLost() {
   closeWinMenu();   // its windows are the old connection's
   regionSent = ''; showKey = '';
+  bumpRev();   // whatever the old connection was still sending is not for the next one
   clearProj();
   stateOnConn = false; replayAnswered = false; boardOpen = null;
   syncClosed();
@@ -1801,6 +1802,8 @@ function onAnnot(m) {
       annotUI();
       break;
     case 'drop':   // the Mac took no part in this stroke: it comes back out
+      if (m.kind === 'dup') break;   // it already holds a stroke with this id, the one the page drew first: that one stays
+      if (typeof m.id !== 'number') break;   // a stale clear or on: no stroke is named
       annotForget(m.id);
       marks.apply({ op: 'erase', ids: [m.id] });
       marksWake();
