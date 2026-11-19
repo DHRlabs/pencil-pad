@@ -160,6 +160,7 @@ final class Targets {
             log.error("target: unknown screen id \(id, privacy: .public); keeping \(self.current.name, privacy: .public)")
             return false
         }
+        if current.id == screen.id { return true }  // already the target: the picture, marks and stream stay as they are
         current = Target(id: screen.id, name: screen.name, rect: screen.bounds)
         Settings.targetScreenID = screen.id
         log.notice("target: \(self.current.name, privacy: .public) \(self.current.id, privacy: .public) rect \(NSStringFromRect(self.current.rect), privacy: .public)")
@@ -287,6 +288,7 @@ final class Targets {
                     let activated = NSRunningApplication(processIdentifier: info.pid)?.activate() ?? false
                     log.notice("pick \(n): \(info.app, privacy: .public) frontmost \(codes.frontmost.rawValue) raise \(codes.raised.rawValue) main \(codes.main.rawValue) activate \(activated)")
                     guard let target else { done(false); return }
+                    if let windowID, windowID == self.windowID { done(true); return }  // already the target window
                     self.current = target
                     self.follow(info.element, info.pid, windowID: windowID)
                     log.notice("target: \(self.current.name, privacy: .public) picked from the window list, rect \(NSStringFromRect(self.current.rect), privacy: .public)")
@@ -350,8 +352,8 @@ final class Targets {
     /// server, is applied (if it is back where it started, nothing is published).
     func publishDeferredFrame() {
         guard pen.held == nil, let window = resizedWhileHeld else { return }
+        guard let now = Self.serverFrame(of: window) else { return }  // unread: keep the note, the next tick retries
         resizedWhileHeld = nil
-        guard let now = Self.serverFrame(of: window) else { return }
         adoptFrame(now, of: window)
     }
 
