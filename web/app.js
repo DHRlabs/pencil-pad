@@ -1,5 +1,5 @@
 // PencilPad iPad page: Pencil input, the Mac socket, and the toolbar.
-// Effects live in fx.js and load after this file, so input never waits on three.js.
+// Effects live in fx.js and load after this file, so input never waits on them.
 // Wire protocol: see AGENTS.md at the repo root.
 
 // board-core.js is a classic script loaded by index.html before this module (see its header). If it
@@ -12,8 +12,8 @@ const PING_MS = 500;
 const DEAD_MS = 3000;     // no frame from the Mac for this long while connected: reconnect
 const PAD = 14;          // gap between the active area and the screen edges
 const GAP = 12;          // gap between the toolbar and the active area
-const STYLES = ['neon', 'aurora', 'ember', 'off'];
-const STYLE_NAMES = { neon: 'Neon', aurora: 'Aurora', ember: 'Ember', off: 'Off' };
+const STYLES = ['line', 'blade', 'rainbow', 'off'];
+const STYLE_NAMES = { line: 'Red line', blade: 'Silver blade', rainbow: 'Rainbow', off: 'Off' };
 
 // Aim (Wacom tip threshold): a touch lighter than this moves the cursor without clicking.
 // Safari reports Pencil pressure as force / maximum force: a light glide sits around 0.03 to 0.12,
@@ -46,9 +46,9 @@ const editorEl = $('editor'), edText = $('ed-text'), edBar = $('ed-bar');
 const token = location.pathname.split('/').filter(Boolean)[0] || '';
 const wsURL = `ws://${location.hostname}:${WS_PORT}/`;
 
-// The active area in CSS px; fx.js reads it every frame.
+// The active area in CSS px.
 const area = { x: 0, y: 0, w: 1, h: 1 };
-const ui = { area, rightArmed: false };
+const ui = { rightArmed: false };
 
 let ws = null, ready = false, halted = '';   // halted: '' | 'denied' | 'replaced'
 let boardOpen = null;        // Board window state the Mac reported on this connection (it sends one after every hello); null = not heard yet
@@ -807,7 +807,6 @@ function updateShowUI() {
   showBtn.setAttribute('aria-pressed', String(showOn));
   const live = showOn && projLive && mode === 'mouse';
   body.classList.toggle('projecting', live);
-  ui.projecting = live;
   quietUI();
 }
 
@@ -910,14 +909,14 @@ function setRight(on) {
 }
 rclickBtn.addEventListener('click', () => setRight(!ui.rightArmed));
 
-// No page effects on the Board or while Show is on: the loop is stopped, the canvas and the Effects button hidden.
+// No page effects on the Board, while Annotate is on, or while Show is on: the loop is stopped, the canvas and the Effects button hidden.
 function quietUI() {
-  const q = mode === 'board' || showOn;
+  const q = mode === 'board' || showOn || annotOn;
   body.classList.toggle('quiet', q);
   if (fx) fx.setQuiet(q);
 }
 
-let style = STYLES.includes(store.get('style')) ? store.get('style') : 'neon';
+let style = STYLES.includes(store.get('style')) ? store.get('style') : 'line';
 function applyStyle() {
   body.dataset.style = style;
   styleName.textContent = STYLE_NAMES[style];
@@ -1041,7 +1040,7 @@ const lightBg = () => board.bg === 'white' || board.bg === 'grid';
 // White ink on the white board draws black and black ink on the dark board draws white.
 const inkColor = () => (lightBg() ? (bColor === '#ffffff' ? '#000000' : bColor) : (bColor === '#000000' ? '#ffffff' : bColor));
 
-// ---------- Ink canvas (the board, over the three.js background) ----------
+// ---------- Ink canvas (the board, over the effects canvas) ----------
 
 let inkRaf = 0, dirtyUntil = 0;
 let tip = { x: 0, y: 0, on: false, c: '#ffffff' };   // the eraser ring follows it; Board mode has no other effects
@@ -1678,6 +1677,7 @@ function annotForget(id) {
 function annotOff() {
   annotLift();
   annotOn = false;
+  quietUI();
   annotUI();
   placeMarks();
 }
@@ -1702,6 +1702,7 @@ annotBtn.addEventListener('click', () => {
   if (!ready || !annotReady || !annotWindow()) return;
   setRight(false);   // a right-click armed for the mouse must not wait behind the marks
   annotOn = true;
+  quietUI();
   send(JSON.stringify({ t: 'annot', op: 'on', gen: annotGen() }));   // the Mac says if this window cannot be marked
   annotUI();
   placeMarks();
@@ -1804,5 +1805,5 @@ fit();
 connect();
 
 import('./fx.js')
-  .then((m) => { fx = m.start({ canvas: $('fx'), queue, ui }); fx.setQuiet(body.classList.contains('quiet')); fx.setStyle(style); })
+  .then((m) => { fx = m.start({ canvas: $('fx'), queue }); fx.setQuiet(body.classList.contains('quiet')); fx.setStyle(style); })
   .catch((err) => { console.warn('PencilPad: effects unavailable, input still works.', err); body.classList.add('nofx'); });
