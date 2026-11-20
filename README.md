@@ -97,7 +97,7 @@ That builds the app, puts it in `/Applications/PencilPad.app`, and opens it. The
 
 ## How it works
 
-The Mac app serves the iPad page over HTTP on port 8710 and takes Pencil input over a WebSocket on port 8711. The page URL includes a token, and the first frame on the socket has to prove that token or the Mac closes the connection. The page draws with three.js, which is vendored in the app, so nothing is fetched from the internet at runtime. One iPad is connected at a time. If the connection drops in the middle of a stroke, the Mac releases the mouse button.
+The Mac app serves the iPad page over HTTP on port 8710 and takes Pencil input over a WebSocket on port 8711. The page URL includes a token, and the first frame on the socket has to prove that token or the Mac closes the connection. The page draws its effects on a plain 2D canvas, so nothing is fetched from the internet at runtime. One iPad is connected at a time. If the connection drops in the middle of a stroke, the Mac releases the mouse button.
 
 ## Requirements and notes
 
@@ -109,4 +109,4 @@ The Mac app serves the iPad page over HTTP on port 8710 and takes Pencil input o
 
 ## License
 
-PencilPad is licensed under the [GNU General Public License v3.0](LICENSE). The bundled three.js is MIT; its license is in `web/vendor/LICENSE-three.txt`.
+PencilPad is licensed under the [GNU General Public License v3.0](LICENSE).
