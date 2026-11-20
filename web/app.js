@@ -82,6 +82,7 @@ function qv(type, sx, sy, p, rx, ry, aux) {
   b[o] = type; b[o + 1] = sx; b[o + 2] = sy; b[o + 3] = p;
   b[o + 4] = rx; b[o + 5] = ry; b[o + 6] = aux; b[o + 7] = performance.now();
   queue.head++;
+  if (queue.wake) queue.wake();   // fx.js stops its frame loop when idle; this restarts it
 }
 
 // ---------- Mapping ----------
