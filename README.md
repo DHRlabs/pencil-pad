@@ -10,6 +10,26 @@ PencilPad turns an iPad and an Apple Pencil into a pen tablet for your Mac over 
 
 Everything runs on your own network. Nothing loads from the internet while you use it.
 
+## Supported iPads and Pencils
+
+PencilPad needs a real Apple Pencil. A generic or capacitive stylus looks like a finger to the iPad, and PencilPad ignores fingers so a resting palm never clicks, so it will not move the cursor.
+
+Any iPad that pairs with one of these four Pencils works. Pick the Pencil that matches your iPad:
+
+| Apple Pencil | Pressure | Works with |
+|---|---|---|
+| Apple Pencil Pro | Yes | iPad Pro (M4, M5), iPad Air (M2, M3, M4), iPad mini (A17 Pro, A20 Pro) |
+| Apple Pencil (2nd generation) | Yes | iPad Pro 11-inch (1st to 4th generation), iPad Pro 12.9-inch (3rd to 6th generation), iPad Air (4th and 5th generation), iPad mini (6th generation) |
+| Apple Pencil (1st generation) | Yes | iPad (6th to 10th generation), iPad (A16), iPad Air (3rd generation), iPad mini (5th generation), iPad Pro 9.7-inch, 10.5-inch, and 12.9-inch (1st and 2nd generation) |
+| Apple Pencil (USB-C) | No | Every iPad listed for the Pro and 2nd generation Pencils, plus iPad (10th generation) and iPad (A16) |
+
+- **Pressure matters.** With pressure, a light touch moves the cursor and a firmer press clicks (the Aim button), and pressure-aware Mac apps vary line weight. The Apple Pencil (USB-C) has no pressure, so every touch clicks and lines stay one weight. Everything else works.
+- **Lowest cost with full support:** iPad (A16) with the Apple Pencil (1st generation). The USB-C adapter it needs for that iPad comes in the Pencil's box.
+- **Lowest cost that works at all:** iPad (A16) with the Apple Pencil (USB-C), without pressure.
+- **Hover is a bonus.** On iPad Pro (M4, M5), iPad Pro 11-inch (4th generation), iPad Pro 12.9-inch (6th generation), iPad Air (M2 and later), and iPad mini (A17 Pro and later), the cursor follows the Pencil while it is just above the glass.
+
+Compatibility follows Apple's own list: [Apple Pencil compatibility](https://support.apple.com/en-us/108937).
+
 ## Pencil in, cursor out
 
 - Only the Pencil moves the cursor. Palms and fingers never click.
@@ -55,7 +75,7 @@ Everything runs on your own network. Nothing loads from the internet while you u
 
 ## Install
 
-Requirements: macOS 15 or later, the Xcode Command Line Tools, and an iPad with an Apple Pencil on the same network.
+Requirements: macOS 15 or later, the Xcode Command Line Tools, and a [supported iPad and Apple Pencil](#supported-ipads-and-pencils) on the same network.
 
 ```sh
 git clone https://github.com/DHRlabs/pencil-pad.git
