@@ -13,18 +13,10 @@
 <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="stylesheet" href="app.css">
-<script type="importmap">
-{
-  "imports": {
-    "three": "./vendor/three.module.js",
-    "three/addons/": "./vendor/addons/"
-  }
-}
-</script>
 <script src="board-core.js"></script>
 <script type="module" src="app.js"></script>
 </head>
-<body data-style="neon" data-conn="connecting">
+<body data-style="line" data-conn="connecting">
   <canvas id="fx" aria-hidden="true"></canvas>
   <canvas id="proj" aria-hidden="true"></canvas>
   <canvas id="ink" aria-hidden="true"></canvas>
@@ -91,7 +83,7 @@
       </button>
       <span class="sep"></span>
       <button type="button" class="tool wide" id="style" title="Effects style" aria-label="Effects style">
-        <span class="swatch"></span><span id="style-name">Neon</span>
+        <span class="swatch"></span><span id="style-name">Red line</span>
       </button>
       <button type="button" class="tool" id="clear" title="Clear trails" aria-label="Clear trails">
         <svg viewBox="0 0 24 24"><path d="M20 20H9"/><path d="m4.6 15.4 9.9-9.9a2 2 0 0 1 2.8 0l2.2 2.2a2 2 0 0 1 0 2.8L11 19H8.2l-3.6-3.6"/><path d="m9.5 10.5 5 5"/></svg>

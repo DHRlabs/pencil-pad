@@ -1,8 +1,8 @@
-/* PencilPad iPad page. Dark glass over a three.js canvas. */
+/* PencilPad iPad page. Dark glass over the effects canvas. */
 
 :root {
-  --accent: 51 240 255;      /* rgb triplets so alpha can vary: rgb(var(--accent) / .3) */
-  --accent2: 255 59 212;
+  --accent: 255 59 48;       /* rgb triplets so alpha can vary: rgb(var(--accent) / .3) */
+  --accent2: 255 140 120;
   --text: #e8ebf5;
   --muted: #8a8fa6;
   --glass: rgb(14 16 28 / .58);
@@ -10,8 +10,8 @@
   --dim: rgb(2 3 8 / .62);
   color-scheme: dark;
 }
-body[data-style="aurora"] { --accent: 72 255 170; --accent2: 139 92 255; }
-body[data-style="ember"]  { --accent: 255 184 77;  --accent2: 255 90 31; }
+body[data-style="blade"]   { --accent: 205 214 230; --accent2: 138 150 170; }
+body[data-style="rainbow"] { --accent: 255 196 64;  --accent2: 90 200 255; }
 body[data-style="off"]    { --accent: 205 210 226; --accent2: 138 143 166; }
 
 html, body {
@@ -85,8 +85,8 @@ body[data-style="off"] #fx, body.nofx #fx, body.quiet #fx, body.quiet #style { d
 #hint span { font-size: 13px; font-weight: 500; color: var(--muted); }
 body.drawn #hint { opacity: 0; }
 
-/* Show: the Mac's picture of the target, exactly over the active area. It is screen-blended over the effects, whose own
-   background is dimmed inside the area while it shows, so the picture reads and trails and sparks still glow over it. */
+/* Show: the Mac's picture of the target, exactly over the active area. It is screen-blended over the page; the effects
+   are stopped while it shows. */
 #proj {
   position: fixed; left: 0; top: 0; width: 0; height: 0; pointer-events: none;
   mix-blend-mode: screen; opacity: 0; border-radius: 4px;
