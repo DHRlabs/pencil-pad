@@ -26,9 +26,10 @@ Any iPad that pairs with one of these four Pencils works. Pick the Pencil that m
 - **Pressure matters.** With pressure, a light touch moves the cursor and a firmer press clicks (the Aim button), and pressure-aware Mac apps vary line weight. The Apple Pencil (USB-C) has no pressure, so every touch clicks and lines stay one weight. Everything else works.
 - **Lowest cost with full support:** iPad (A16) with the Apple Pencil (1st generation). The USB-C adapter it needs for that iPad comes in the Pencil's box.
 - **Lowest cost that works at all:** iPad (A16) with the Apple Pencil (USB-C), without pressure.
+- **Already have an iPad?** Check it against the table first. If it is listed, you only need the matching Pencil. Apple's refurbished store often has the iPad (10th generation), which works the same as the iPad (A16) here.
 - **Hover is a bonus.** On iPad Pro (M4, M5), iPad Pro 11-inch (4th generation), iPad Pro 12.9-inch (6th generation), iPad Air (M2 and later), and iPad mini (A17 Pro and later), the cursor follows the Pencil while it is just above the glass.
 
-Compatibility follows Apple's own list: [Apple Pencil compatibility](https://support.apple.com/en-us/108937).
+Compatibility follows Apple's own list: [Apple Pencil compatibility](https://support.apple.com/en-us/108937). The Apple Pencil Pro needs iPadOS 17.5 or later, and the Apple Pencil (USB-C) needs iPadOS 17.1.1 or later.
 
 ## Pencil in, cursor out
 
